@@ -5714,7 +5714,7 @@ class DiscordAdapter(BasePlatformAdapter):
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Render a clarify prompt with one Discord button per choice.
+        """Render one plain-text clarify prompt with optional Discord buttons.
 
         Multi-choice mode (``choices`` non-empty): renders a button per option
         plus a final "✏️ Other (type answer)" button. Picking "Other" flips
@@ -5723,8 +5723,8 @@ class DiscordAdapter(BasePlatformAdapter):
         via ``resolve_gateway_clarify(clarify_id, choice_text)``.
 
         Open-ended mode (``choices`` empty/None): renders the question as
-        plain embed text — no buttons. The gateway's text-intercept captures
-        the next message in this session and resolves the clarify.
+        plain text — no buttons. The gateway's text-intercept captures the
+        next message in this session and resolves the clarify.
 
         Choice normalisation: ``choices`` may contain bare strings OR dicts
         (LLMs sometimes emit ``[{"description": "..."}]`` instead of bare
@@ -5744,18 +5744,6 @@ class DiscordAdapter(BasePlatformAdapter):
             channel = self._client.get_channel(int(target_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(target_id))
-
-            # Discord embed description limit is 4096; trim conservatively.
-            max_desc = 4088
-            body = str(question or "").strip()
-            if len(body) > max_desc:
-                body = body[: max_desc - 3] + "..."
-
-            embed = discord.Embed(
-                title="❓ Hermes needs your input",
-                description=body,
-                color=discord.Color.orange(),
-            )
 
             # Normalise choices: LLMs sometimes emit `[{"description": "..."}]`
             # instead of bare strings, which would render as raw Python repr on
@@ -5794,11 +5782,6 @@ class DiscordAdapter(BasePlatformAdapter):
             clean_choices = clean_choices[:24]
 
             if clean_choices:
-                embed.add_field(
-                    name="Choices",
-                    value="Pick one below, or click ✏️ Other to type a custom answer.",
-                    inline=False,
-                )
                 view = ClarifyChoiceView(
                     choices=clean_choices,
                     clarify_id=clarify_id,
@@ -5806,25 +5789,34 @@ class DiscordAdapter(BasePlatformAdapter):
                     allowed_role_ids=self._allowed_role_ids,
                 )
             else:
-                embed.add_field(
-                    name="Reply",
-                    value="Reply in this channel with your answer.",
-                    inline=False,
-                )
                 view = None
 
-            # Mirror the question in plain content — embeds are invisible on
-            # some clients (see send_exec_approval).
+            # Clarify used to send the same question as both plain content and
+            # an embed.  Discord rendered both surfaces, so one Atena prompt
+            # looked like two simultaneous replies.  Keep one accessible,
+            # editable plain-text surface; buttons do not require an embed.
+            bot_user = getattr(self._client, "user", None)
+            bot_display_name = None
+            for candidate in (
+                getattr(bot_user, "display_name", None),
+                getattr(bot_user, "global_name", None),
+                getattr(bot_user, "name", None),
+            ):
+                if isinstance(candidate, str) and candidate.strip():
+                    bot_display_name = candidate.strip()
+                    break
+            bot_display_name = bot_display_name or "Hermes"
             clarify_tail = (
-                "\n\nPick one below, or click ✏️ Other to type a custom answer."
+                "\n\nEscolha uma opção abaixo ou clique em ✏️ Other para responder em texto."
                 if clean_choices
-                else "\n\nReply in this channel with your answer."
+                else "\n\nResponda neste canal com a informação solicitada."
             )
             content = self._self_contained_prompt_content(
-                "❓ **Hermes needs your input**", str(question or "").strip(),
+                f"❓ **{bot_display_name} precisa da sua resposta**",
+                str(question or "").strip(),
                 tail=clarify_tail,
             )
-            msg = await channel.send(content=content, embed=embed, view=view) if view else await channel.send(content=content, embed=embed)
+            msg = await channel.send(content=content, view=view) if view else await channel.send(content=content)
             if view:
                 view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))
@@ -7600,6 +7592,14 @@ def _define_discord_view_classes() -> None:
                 interaction, self.allowed_user_ids, self.allowed_role_ids,
             )
 
+        @staticmethod
+        def _content_with_status(message: Any, status: str) -> str:
+            """Append a bounded status line to a plain-text clarify prompt."""
+            content = str(getattr(message, "content", "") or "")
+            suffix = f"\n\n{status}"
+            budget = max(0, DiscordAdapter.MAX_MESSAGE_LENGTH - len(suffix))
+            return f"{content[:budget].rstrip()}{suffix}"
+
         def _make_choice_callback(self, index: int, choice: str):
             async def _callback(interaction: "discord.Interaction"):
                 await self._resolve_choice(interaction, index, choice)
@@ -7630,14 +7630,24 @@ def _define_discord_view_classes() -> None:
             embed = interaction.message.embeds[0] if (
                 interaction.message and interaction.message.embeds
             ) else None
+            user = getattr(interaction, "user", None)
+            display_name = getattr(user, "display_name", "user")
+            edit_kwargs = {"view": self}
             if embed:
-                user = getattr(interaction, "user", None)
-                display_name = getattr(user, "display_name", "user")
                 embed.color = discord.Color.green()
                 embed.set_footer(text=f"Answered by {display_name}: {choice}")
+                edit_kwargs["embed"] = embed
+            else:
+                choice_display = str(choice)
+                if len(choice_display) > 160:
+                    choice_display = choice_display[:157] + "..."
+                edit_kwargs["content"] = self._content_with_status(
+                    interaction.message,
+                    f"✅ Respondido por {display_name}: {choice_display}",
+                )
 
             try:
-                await interaction.response.edit_message(embed=embed, view=self)
+                await interaction.response.edit_message(**edit_kwargs)
             except Exception:
                 logger.debug(
                     "Discord clarify edit_message failed for %s",
@@ -7710,16 +7720,23 @@ def _define_discord_view_classes() -> None:
             embed = interaction.message.embeds[0] if (
                 interaction.message and interaction.message.embeds
             ) else None
+            user = getattr(interaction, "user", None)
+            display_name = getattr(user, "display_name", "user")
+            edit_kwargs = {"view": self}
             if embed:
-                user = getattr(interaction, "user", None)
-                display_name = getattr(user, "display_name", "user")
                 embed.color = discord.Color.blue()
                 embed.set_footer(
                     text=f"Awaiting typed response from {display_name}…",
                 )
+                edit_kwargs["embed"] = embed
+            else:
+                edit_kwargs["content"] = self._content_with_status(
+                    interaction.message,
+                    f"✏️ Aguardando a resposta digitada de {display_name}…",
+                )
 
             try:
-                await interaction.response.edit_message(embed=embed, view=self)
+                await interaction.response.edit_message(**edit_kwargs)
             except Exception:
                 try:
                     await interaction.response.defer()
@@ -7738,7 +7755,15 @@ def _define_discord_view_classes() -> None:
                     if embed:
                         embed.color = discord.Color.greyple()
                         embed.set_footer(text="⏱ Prompt expired — no action taken")
-                    await msg.edit(embed=embed, view=self)
+                        await msg.edit(embed=embed, view=self)
+                    else:
+                        await msg.edit(
+                            content=self._content_with_status(
+                                msg,
+                                "⏱ Pergunta expirada — nenhuma ação foi executada.",
+                            ),
+                            view=self,
+                        )
                 except Exception:
                     pass
 if DISCORD_AVAILABLE:
