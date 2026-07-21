@@ -41,6 +41,9 @@ def _make_adapter(*, allowed_users=None, allowed_roles=None):
     config = PlatformConfig(enabled=True, token="test-token", extra={})
     adapter = DiscordAdapter(config)
     adapter._client = MagicMock()
+    adapter._client.user = SimpleNamespace(
+        display_name="Atena", global_name="Atena", name="Atena",
+    )
     adapter._allowed_user_ids = set(allowed_users or [])
     adapter._allowed_role_ids = set(allowed_roles or [])
     return adapter
@@ -55,7 +58,7 @@ def _clear_clarify_state():
 
 
 def _make_interaction(*, user_id="42", display_name="Tester", roles=None,
-                      include_message=True):
+                      include_message=True, include_embed=True):
     """Build a mock discord.Interaction with response.edit_message /
     send_message / defer all coroutine-callable."""
     user = SimpleNamespace(
@@ -69,10 +72,16 @@ def _make_interaction(*, user_id="42", display_name="Tester", roles=None,
         defer=AsyncMock(),
     )
     if include_message:
-        embed = MagicMock()
-        embed.color = None
-        embed.set_footer = MagicMock()
-        message = SimpleNamespace(embeds=[embed])
+        embeds = []
+        if include_embed:
+            embed = MagicMock()
+            embed.color = None
+            embed.set_footer = MagicMock()
+            embeds = [embed]
+        message = SimpleNamespace(
+            embeds=embeds,
+            content="❓ **Atena precisa da sua resposta**\n\nPergunta?",
+        )
     else:
         message = None
     return SimpleNamespace(user=user, response=response, message=message)
@@ -223,6 +232,28 @@ class TestClarifyChoiceResolve:
         interaction.response.edit_message.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_choice_updates_plain_prompt_without_reintroducing_embed(self):
+        from tools import clarify_gateway as cm
+        cm.register("cidPlain", "sk-plain", "Pick", ["red", "green"])
+
+        view = ClarifyChoiceView(
+            choices=["red", "green"],
+            clarify_id="cidPlain",
+            allowed_user_ids={"42"},
+        )
+        interaction = _make_interaction(
+            user_id="42", display_name="Marcelo", include_embed=False,
+        )
+
+        await view._resolve_choice(interaction, index=1, choice="green")
+
+        kwargs = interaction.response.edit_message.call_args.kwargs
+        assert "embed" not in kwargs
+        assert "Atena precisa da sua resposta" in kwargs["content"]
+        assert "Respondido por Marcelo: green" in kwargs["content"]
+        assert kwargs["view"] is view
+
+    @pytest.mark.asyncio
     async def test_choice_falls_back_to_label_text_when_entry_missing(self):
         """If the gateway entry vanished (race / stale view), the button's
         own choice text is used as the response."""
@@ -324,6 +355,28 @@ class TestClarifyOtherButton:
         interaction.response.edit_message.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_other_updates_plain_prompt_without_reintroducing_embed(self):
+        from tools import clarify_gateway as cm
+        cm.register("cidPlainOther", "sk-plain-other", "Pick", ["x"])
+
+        view = ClarifyChoiceView(
+            choices=["x"],
+            clarify_id="cidPlainOther",
+            allowed_user_ids={"42"},
+        )
+        interaction = _make_interaction(
+            user_id="42", display_name="Marcelo", include_embed=False,
+        )
+
+        await view._on_other(interaction)
+
+        kwargs = interaction.response.edit_message.call_args.kwargs
+        assert "embed" not in kwargs
+        assert "Atena precisa da sua resposta" in kwargs["content"]
+        assert "Aguardando a resposta digitada de Marcelo" in kwargs["content"]
+        assert kwargs["view"] is view
+
+    @pytest.mark.asyncio
     async def test_other_unauthorized_user_rejected(self):
         from tools import clarify_gateway as cm
         cm.register("cidE", "sk-E", "Pick", ["x"])
@@ -348,7 +401,7 @@ class TestClarifyOtherButton:
 # ===========================================================================
 
 class TestDiscordSendClarify:
-    """Verify send_clarify renders an embed and (optionally) attaches the view."""
+    """Verify send_clarify renders one plain prompt and optional buttons."""
 
     def setup_method(self):
         _clear_clarify_state()
@@ -372,10 +425,12 @@ class TestDiscordSendClarify:
 
         assert result.success is True
         assert result.message_id == "123456"
-        # Verify channel.send was called with embed + view kwargs
+        # One plain-text surface plus the interactive view; no duplicate embed.
         channel.send.assert_called_once()
         kwargs = channel.send.call_args.kwargs
-        assert "embed" in kwargs
+        assert "embed" not in kwargs
+        assert "Atena precisa da sua resposta" in kwargs["content"]
+        assert "Pick a color" in kwargs["content"]
         assert "view" in kwargs
         assert isinstance(kwargs["view"], ClarifyChoiceView)
         # 3 choice buttons + 1 Other
@@ -401,9 +456,11 @@ class TestDiscordSendClarify:
         assert result.success is True
         channel.send.assert_called_once()
         kwargs = channel.send.call_args.kwargs
-        # Open-ended path renders embed but no view (text-capture handles reply)
-        assert "embed" in kwargs
+        # Open-ended path stays plain-text; text-capture handles the reply.
+        assert "embed" not in kwargs
         assert "view" not in kwargs
+        assert "Atena precisa da sua resposta" in kwargs["content"]
+        assert "What is your name?" in kwargs["content"]
 
     @pytest.mark.asyncio
     async def test_routes_to_thread_when_metadata_thread_id_set(self):

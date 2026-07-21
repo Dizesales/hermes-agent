@@ -1,7 +1,8 @@
-"""Sibling coverage for the embed-invisibility fix (send_exec_approval got it
-in the same PR): slash confirm, clarify, and update prompts must also mirror
-their payload into plain message content, since embeds don't render on some
-Discord clients (web/mobile)."""
+"""Sibling coverage for self-contained Discord interactive prompts.
+
+Slash-confirm and update prompts preserve their richer embeds. Clarify uses one
+plain-text surface so the same question does not render twice on web/mobile.
+"""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -23,6 +24,9 @@ def _capture_channel(adapter):
     adapter._client = SimpleNamespace(
         get_channel=lambda _chat_id: channel,
         fetch_channel=AsyncMock(),
+        user=SimpleNamespace(
+            display_name="Atena", global_name="Atena", name="Atena",
+        ),
     )
     return sent
 
@@ -66,7 +70,7 @@ async def test_slash_confirm_truncates_long_message_in_content():
 
 
 @pytest.mark.asyncio
-async def test_clarify_with_choices_mirrors_question_into_content():
+async def test_clarify_with_choices_uses_one_plain_text_surface():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     sent = _capture_channel(adapter)
 
@@ -80,9 +84,10 @@ async def test_clarify_with_choices_mirrors_question_into_content():
 
     assert result.success is True
     assert sent["view"] is not None
-    assert "Hermes needs your input" in sent["content"]
+    assert sent.get("embed") is None
+    assert "Atena precisa da sua resposta" in sent["content"]
     assert "Which environment should I deploy to?" in sent["content"]
-    assert "Pick one below" in sent["content"]
+    assert "Escolha uma opção" in sent["content"]
 
 
 @pytest.mark.asyncio
@@ -100,8 +105,9 @@ async def test_clarify_without_choices_mirrors_question_and_reply_hint():
 
     assert result.success is True
     assert sent.get("view") is None
+    assert sent.get("embed") is None
     assert "What should the cron schedule be?" in sent["content"]
-    assert "Reply in this channel" in sent["content"]
+    assert "Responda neste canal" in sent["content"]
 
 
 @pytest.mark.asyncio
