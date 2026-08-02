@@ -4659,6 +4659,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ).fetchone()
         return row is not None
 
+    def is_compression_ancestor(self, ancestor_id: str, descendant_id: str) -> bool:
+        """Prove a compression-continuation relationship without mutation."""
+        with self._lock:
+            return self._is_compression_ancestor(
+                self._conn,
+                ancestor_id=str(ancestor_id or ""),
+                descendant_id=str(descendant_id or ""),
+            )
+
     def _set_session_title(
         self,
         session_id: str,

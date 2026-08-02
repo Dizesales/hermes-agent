@@ -35,6 +35,7 @@ def _clear_component_auth_env(monkeypatch):
 
     for name in (
         "DISCORD_ALLOW_ALL_USERS",
+        "DISCORD_DM_ALLOWED_USERS",
         "GATEWAY_ALLOW_ALL_USERS",
         "GATEWAY_ALLOWED_USERS",
     ):
@@ -54,7 +55,7 @@ def _clear_component_auth_env(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _interaction(user_id, role_ids=None, *, drop_user=False, drop_roles=False):
+def _interaction(user_id, role_ids=None, *, drop_user=False, drop_roles=False, is_dm=True):
     """Build a mock interaction with the requested user/role shape.
 
     drop_user simulates a payload whose .user attribute is None.
@@ -62,12 +63,15 @@ def _interaction(user_id, role_ids=None, *, drop_user=False, drop_roles=False):
     at all (DM-context Member, raw User payload).
     """
     if drop_user:
-        return SimpleNamespace(user=None)
+        return SimpleNamespace(user=None, guild=None if is_dm else SimpleNamespace(id=1))
 
     user_kwargs = {"id": user_id}
     if not drop_roles:
         user_kwargs["roles"] = [SimpleNamespace(id=r) for r in (role_ids or [])]
-    return SimpleNamespace(user=SimpleNamespace(**user_kwargs))
+    return SimpleNamespace(
+        user=SimpleNamespace(**user_kwargs),
+        guild=None if is_dm else SimpleNamespace(id=1),
+    )
 
 
 # ── no policy configured -> deny unless allow-all is explicit ──────────────
@@ -278,3 +282,17 @@ def test_other_views_not_admin_gated():
     )
     assert sc._check_auth(_interaction(11111)) is True
 
+
+def test_component_dm_ceiling_precedes_allow_all_and_pairing(monkeypatch):
+    monkeypatch.setenv("DISCORD_DM_ALLOWED_USERS", "11111")
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+    interaction = _interaction(99999, is_dm=True)
+
+    assert _component_check_auth(interaction, {"11111", "99999"}, set()) is False
+
+
+def test_component_dm_ceiling_does_not_reduce_guild_access(monkeypatch):
+    monkeypatch.setenv("DISCORD_DM_ALLOWED_USERS", "11111")
+    interaction = _interaction(99999, is_dm=False)
+
+    assert _component_check_auth(interaction, {"11111", "99999"}, set()) is True

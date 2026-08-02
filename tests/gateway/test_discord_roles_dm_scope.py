@@ -49,6 +49,28 @@ def _make_adapter(allowed_users=None, allowed_roles=None, guilds=None):
     return adapter
 
 
+def test_dm_specific_allowlist_is_a_ceiling_without_reducing_guild_access(monkeypatch):
+    """A group-authorized operator stays valid in guilds but cannot use DMs."""
+    _set_dm_role_auth_guild(monkeypatch)
+    guild = SimpleNamespace(id=222222, get_member=lambda uid: None)
+    adapter = _make_adapter(allowed_users=["11", "22"], guilds=[guild])
+    adapter._dm_allowed_user_ids = {"11"}
+
+    assert adapter._is_allowed_user("11", guild=None, is_dm=True) is True
+    assert adapter._is_allowed_user("22", guild=None, is_dm=True) is False
+    assert adapter._is_allowed_user("22", guild=guild, is_dm=False) is True
+
+
+def test_dm_specific_allowlist_precedes_pairing(monkeypatch):
+    """A prior pairing grant cannot reopen a DM closed by the DM ceiling."""
+    _set_dm_role_auth_guild(monkeypatch)
+    adapter = _make_adapter(allowed_users=["11", "22"])
+    adapter._dm_allowed_user_ids = {"11"}
+    adapter._is_pairing_approved_user = lambda _user_id: True
+
+    assert adapter._is_allowed_user("22", guild=None, is_dm=True) is False
+
+
 def _role(role_id):
     return SimpleNamespace(id=role_id)
 

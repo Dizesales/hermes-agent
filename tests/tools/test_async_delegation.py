@@ -729,3 +729,27 @@ def test_gateway_cli_origin_event_left_unrouted():
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
 
+
+def test_reset_for_tests_prevents_late_completion_queue_writes():
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "late"}
+
+    ad.dispatch_async_delegation(
+        goal="late worker", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=runner, max_async_children=1,
+    )
+    timer = threading.Timer(0.05, gate.set)
+    timer.start()
+    try:
+        ad._reset_for_tests()
+    finally:
+        timer.cancel()
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+    time.sleep(0.1)
+
+    assert process_registry.completion_queue.empty()

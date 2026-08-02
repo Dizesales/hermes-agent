@@ -5,6 +5,7 @@ agent dispatch. It runs in _handle_message and acts on returned action
 dicts: {"action": "skip"|"rewrite"|"allow"}.
 """
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -118,3 +119,43 @@ async def test_hook_fires_without_session_store_attribute(monkeypatch):
     # Hook actually fired (skip short-circuited before auth) with a None store.
     assert seen == {"session_store": None}
     adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_async_hook_skip_is_awaited_before_dispatch(monkeypatch):
+    _clear_auth_env(monkeypatch)
+
+    async def _async_skip():
+        await asyncio.sleep(0)
+        return {"action": "skip", "reason": "async-plugin-handled"}
+
+    def _fake_hook(name, **kwargs):
+        return [_async_skip()] if name == "pre_gateway_dispatch" else []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+
+    assert await runner._handle_message(_make_event("hi")) is None
+    adapter.send.assert_not_awaited()
+    runner.pairing_store.generate_code.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_async_hook_failure_does_not_discard_other_results(monkeypatch):
+    _clear_auth_env(monkeypatch)
+
+    async def _async_failure():
+        await asyncio.sleep(0)
+        raise RuntimeError("async plugin blew up")
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [_async_failure(), {"action": "skip", "reason": "other-plugin"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+
+    assert await runner._handle_message(_make_event("hi")) is None
+    adapter.send.assert_not_awaited()
+    runner.pairing_store.generate_code.assert_not_called()

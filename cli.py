@@ -10305,6 +10305,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         session key, so resolve that key to its continuation before comparing.
         Missing or foreign keys fail closed and remain queued for their owner.
         """
+        if event.get("type") == "async_delegation":
+            return self._owns_async_delegation_event(event)
+
         event_key = str(event.get("session_key") or "")
         current_key = str(getattr(self, "session_id", "") or "")
         if not event_key or not current_key:
@@ -14587,6 +14590,53 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 completions_menu,
             ] if item is not None
         ]
+
+    def _owns_async_delegation_event(self, evt: dict) -> bool:
+        """Return True only with positive proof that *evt* belongs here.
+
+        A CLI may restore durable completions before an approval-context key is
+        installed.  Never use that thread-local key as the ownership source:
+        bind to the CLI/agent session IDs and, for pre-compression dispatches,
+        the canonical compression lineage in SessionDB.  Missing identity,
+        foreign sessions, DB failures, branches, and subagent parent links all
+        fail closed.
+        """
+        if not isinstance(evt, dict) or evt.get("type") != "async_delegation":
+            return False
+
+        current_ids = {
+            str(value).strip()
+            for value in (
+                getattr(self, "session_id", ""),
+                getattr(getattr(self, "agent", None), "session_id", ""),
+            )
+            if str(value or "").strip()
+        }
+        event_ids = {
+            str(value).strip()
+            for value in (
+                evt.get("session_key"),
+                evt.get("parent_session_id"),
+            )
+            if str(value or "").strip()
+        }
+        if not current_ids or not event_ids:
+            return False
+        if current_ids.intersection(event_ids):
+            return True
+
+        session_db = getattr(self, "_session_db", None)
+        lineage_check = getattr(session_db, "is_compression_ancestor", None)
+        if not callable(lineage_check):
+            return False
+        try:
+            return any(
+                lineage_check(event_id, current_id)
+                for event_id in event_ids
+                for current_id in current_ids
+            )
+        except Exception:
+            return False
 
     def run(self):
         """Run the interactive CLI loop with persistent input at bottom."""

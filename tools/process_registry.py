@@ -1262,11 +1262,9 @@ class ProcessRegistry:
         - ``session_key``: plain key equality (CLI and other single-session
           callers). Non-matching addressed events are re-queued.
 
-        With neither set, all events are consumed (legacy single-session
-        behavior, backward compatible). Ownerless ordinary notifications also
-        retain that legacy behavior even when a filter is provided. When a
-        filter is provided, ownerless async-delegation events remain
-        fail-closed and require positive proof.
+        With neither set, async-delegation events are re-queued because their
+        conversation payload requires positive ownership proof. Ownerless
+        ordinary notifications retain the legacy single-session behavior.
         """
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
@@ -1297,10 +1295,9 @@ class ProcessRegistry:
                 if evt_session_key != session_key:
                     requeue.append(evt)
                     continue
-            elif is_async_delegation and evt.get("restored"):
-                # Durable restore can enqueue previous-process payloads into a
-                # fresh registry. An unfiltered legacy drain cannot prove
-                # ownership, so leave those events queued for the owner.
+            elif is_async_delegation:
+                # Conversation payloads require proof whether restored from
+                # disk or produced in this process.
                 requeue.append(evt)
                 continue
             # Local consumed/observed state may suppress only events this

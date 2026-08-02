@@ -809,7 +809,7 @@ class TestGeneratedUnitIncludesLocalBin:
             "_build_user_local_paths",
             lambda home_path, existing: [str(home_path / ".local" / "bin")],
         )
-        unit = gateway_cli.generate_systemd_unit(system=True)
+        unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="root")
         # System unit uses the resolved home dir from _system_service_identity
         assert "/.local/bin" in unit
 

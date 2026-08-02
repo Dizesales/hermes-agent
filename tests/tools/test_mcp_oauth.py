@@ -834,3 +834,50 @@ def test_humanize_non_registration_403_passthrough():
         )
         is None
     )
+
+
+def test_back_to_back_oauth_providers_keep_independent_ports(monkeypatch):
+    from tools import mcp_oauth as mod
+
+    class _FakeProvider:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(mod, "_OAUTH_AVAILABLE", True)
+    monkeypatch.setattr(mod, "OAuthClientProvider", _FakeProvider)
+    monkeypatch.setattr(mod, "_is_interactive", lambda: True)
+    monkeypatch.setattr(mod, "_maybe_preregister_client", lambda *a: None)
+    redirect_ports = []
+    callback_ports = []
+
+    def spy_redirect_factory(port, redirect_uri=None):
+        del redirect_uri
+        redirect_ports.append(port)
+
+        async def _redirect(_url):
+            return None
+
+        return _redirect
+
+    def spy_callback_factory(port):
+        callback_ports.append(port)
+
+        async def _callback():
+            return "code", "state"
+
+        return _callback
+
+    monkeypatch.setattr(mod, "_make_redirect_handler", spy_redirect_factory)
+    monkeypatch.setattr(mod, "_make_callback_waiter", spy_callback_factory)
+
+    p1 = build_oauth_auth(
+        "server-a", "https://a.example.com/mcp", {"redirect_port": 41001}
+    )
+    p2 = build_oauth_auth(
+        "server-b", "https://b.example.com/mcp", {"redirect_port": 41002}
+    )
+    assert isinstance(p1, _FakeProvider)
+    assert isinstance(p2, _FakeProvider)
+
+    assert redirect_ports == [41001, 41002]
+    assert callback_ports == [41001, 41002]

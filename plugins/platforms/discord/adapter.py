@@ -917,6 +917,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._client: Optional[commands.Bot] = None
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
+        # Optional DM-only ceiling.  ``_allowed_user_ids`` remains the broader
+        # guild/group admission set, while this list can narrow private intake
+        # without removing operators from approved server channels.
+        self._dm_allowed_user_ids: Optional[set] = None
         self._allowed_role_ids: set = set()  # For DISCORD_ALLOWED_ROLES filtering
         self.gateway_runner = None  # Set by gateway/run.py for cross-platform delivery
         # Voice channel state (per-guild)
@@ -1159,6 +1163,17 @@ class DiscordAdapter(BasePlatformAdapter):
             if allowed_env:
                 self._allowed_user_ids = {
                     _clean_discord_id(uid) for uid in allowed_env.split(",")
+                    if uid.strip()
+                }
+
+            # A profile may admit several users in approved guild channels but
+            # expose DMs to a smaller set.  Preserve ``None`` for the legacy
+            # behavior when no DM-specific policy is configured; an explicitly
+            # empty value is a valid fail-closed "block every DM" policy.
+            dm_allowed_env = os.getenv("DISCORD_DM_ALLOWED_USERS")
+            if dm_allowed_env is not None:
+                self._dm_allowed_user_ids = {
+                    _clean_discord_id(uid) for uid in dm_allowed_env.split(",")
                     if uid.strip()
                 }
 
@@ -4475,6 +4490,14 @@ class DiscordAdapter(BasePlatformAdapter):
         allowed_roles = getattr(self, "_allowed_role_ids", set())
         has_users = bool(allowed_users)
         has_roles = bool(allowed_roles)
+
+        # DM-specific admission is a ceiling, not another OR grant.  Evaluate
+        # it before pairing, global allow-all, user, or role authorization so a
+        # previously paired/group-authorized user cannot reopen private access.
+        dm_allowed_users = getattr(self, "_dm_allowed_user_ids", None)
+        if is_dm and dm_allowed_users is not None:
+            if "*" not in dm_allowed_users and user_id not in dm_allowed_users:
+                return False
 
         # Pairing is a first-class auth grant in the gateway auth union and in
         # Discord component buttons. Honor it here too so normal guild/DM text
@@ -8010,11 +8033,6 @@ def _component_check_auth(
     if user is None or getattr(user, "id", None) is None:
         return False
 
-    if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
-        return True
-    if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
-        return True
-
     user_set = {str(uid).strip() for uid in (allowed_user_ids or set()) if str(uid).strip()}
     global_allowed = {
         uid.strip()
@@ -8031,6 +8049,22 @@ def _component_check_auth(
         uid = str(user.id)
     except AttributeError:
         uid = ""
+
+    # Component callbacks are a second private interaction surface.  Apply the
+    # same DM ceiling used by message/slash intake before any broader grant.
+    dm_allowed_env = os.getenv("DISCORD_DM_ALLOWED_USERS")
+    is_dm = getattr(interaction, "guild", None) is None
+    if is_dm and dm_allowed_env is not None:
+        dm_allowed_users = {
+            entry.strip() for entry in dm_allowed_env.split(",") if entry.strip()
+        }
+        if "*" not in dm_allowed_users and uid not in dm_allowed_users:
+            return False
+
+    if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+        return True
+    if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+        return True
 
     if has_users:
         if "*" in user_set or (uid and uid in user_set):
@@ -9679,6 +9713,14 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         if isinstance(allowed_users_cfg, list):
             allowed_users_cfg = ",".join(str(v) for v in allowed_users_cfg)
         os.environ["DISCORD_ALLOWED_USERS"] = str(allowed_users_cfg)
+    dm_allowed_users_cfg = (
+        discord_cfg["dm_allow_from"] if "dm_allow_from" in discord_cfg
+        else platform_extra_cfg.get("dm_allow_from")
+    )
+    if dm_allowed_users_cfg is not None and os.getenv("DISCORD_DM_ALLOWED_USERS") is None:
+        if isinstance(dm_allowed_users_cfg, list):
+            dm_allowed_users_cfg = ",".join(str(v) for v in dm_allowed_users_cfg)
+        os.environ["DISCORD_DM_ALLOWED_USERS"] = str(dm_allowed_users_cfg)
     approval_mentions_cfg = (
         discord_cfg["approval_mentions"] if "approval_mentions" in discord_cfg
         else platform_extra_cfg.get("approval_mentions")

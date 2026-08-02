@@ -144,6 +144,36 @@ def test_is_user_authorized_from_message_allow_from():
     assert adapter._is_user_authorized_from_message(msg) is False
 
 
+def test_dm_specific_allowlist_blocks_private_only_and_preserves_group_users():
+    adapter = _make_adapter(allow_from=["111", "222"], dm_allow_from=["111"])
+
+    assert adapter._is_user_authorized_from_message(
+        _make_message(from_user_id=111, chat_id=111, chat_type="private")
+    ) is True
+    assert adapter._is_user_authorized_from_message(
+        _make_message(from_user_id=222, chat_id=222, chat_type="private")
+    ) is False
+    assert adapter._is_user_authorized_from_message(
+        _make_message(from_user_id=222, chat_id=-100, chat_type="group")
+    ) is True
+
+
+def test_dm_specific_allowlist_precedes_runner_pairing_authorization():
+    class Runner:
+        def _is_user_authorized(self, _source):
+            return True
+
+        async def handle(self, _event):
+            return None
+
+    adapter = _make_adapter(dm_allow_from=["111"])
+    adapter._message_handler = Runner().handle
+
+    assert adapter._is_user_authorized_from_message(
+        _make_message(from_user_id=222, chat_id=222, chat_type="private")
+    ) is False
+
+
 def test_runner_auth_gets_group_user_allowlist_context(monkeypatch):
     """Group user allowlists need a group-shaped source, not a DM-shaped one."""
     monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_USERS", "111")

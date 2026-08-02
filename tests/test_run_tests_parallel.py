@@ -363,6 +363,53 @@ def test_node_id_selector_runs_the_named_test(tmp_path: Path) -> None:
     assert "1 tests passed" in proc.stdout
 
 
+def test_runner_isolates_and_removes_hermes_home(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = tmp_path / "home-probe"
+    probe_dir.mkdir()
+    handoff = tmp_path / "resolved-home.txt"
+    inherited_home = tmp_path / "must-not-be-used"
+    (probe_dir / "test_home_probe.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n\n"
+        "def test_home_is_writable_and_isolated():\n"
+        "    home = Path(os.environ['HERMES_HOME']).resolve()\n"
+        f"    assert home != Path({str(inherited_home)!r}).resolve()\n"
+        "    cron = home / 'cron'\n"
+        "    cron.mkdir(parents=True)\n"
+        "    (cron / 'jobs.json').write_text('{}')\n"
+        f"    Path({str(handoff)!r}).write_text(str(home))\n"
+    )
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(inherited_home)
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "1",
+            "--file-timeout",
+            "30",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    resolved_home = Path(handoff.read_text())
+    assert resolved_home != inherited_home
+    assert not resolved_home.exists()
+    assert not inherited_home.exists()
+
+
 def test_explicit_k_wins_over_node_id_inference(tmp_path: Path) -> None:
     """A caller's own ``-k`` is not overridden by the node-id translation."""
     probe_dir = _make_probe_dir(tmp_path)

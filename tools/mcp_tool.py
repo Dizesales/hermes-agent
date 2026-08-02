@@ -3818,6 +3818,14 @@ def _is_auth_error(exc: BaseException) -> bool:
     response status code is 401. Other HTTP errors fall through to the
     generic error path in the tool handlers.
     """
+    # AnyIO/asyncio task groups wrap transport/auth failures in an
+    # ExceptionGroup. Treat a group as auth-related when any nested leaf is
+    # auth-related; otherwise the initial-connect loop mistakes an OAuth
+    # callback failure for a transient network error and starts a fresh OAuth
+    # flow with a new PKCE state.
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_is_auth_error(child) for child in exc.exceptions)
+
     types = _get_auth_error_types()
     if not types or not isinstance(exc, types):
         return False

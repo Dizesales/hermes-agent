@@ -20,9 +20,16 @@ import {
   extractBridgeEvent,
   inboundReadReceiptKeys,
   mediaPayloadForFile,
+  normalizeWhatsAppLookupCandidates,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+
+assert.deepEqual(
+  normalizeWhatsAppLookupCandidates(['+55 98 99999-9999', '5598999999999', 'invalid', '123']),
+  ['5598999999999'],
+);
+console.log('  ✓ WhatsApp lookup candidates are normalized, validated, and deduplicated');
 
 // -- inbound read receipts ------------------------------------------------
 {

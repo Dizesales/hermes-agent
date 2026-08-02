@@ -18,6 +18,13 @@ export function normalizeWhatsAppId(value) {
   return String(value).replace(':', '@');
 }
 
+export function normalizeWhatsAppLookupCandidates(values, limit = 3) {
+  const candidates = Array.isArray(values) ? values : [];
+  return [...new Set(candidates.map(value => String(value || '').replace(/\D/g, '')))]
+    .filter(value => /^\d{8,15}$/.test(value))
+    .slice(0, Math.max(0, limit));
+}
+
 export function getMessageContent(msg) {
   const content = msg?.message || {};
   if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;

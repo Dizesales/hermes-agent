@@ -919,17 +919,25 @@ class TelegramAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
+        normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
+        if normalized_chat_type == "private":
+            normalized_chat_type = "dm"
+        elif normalized_chat_type == "supergroup":
+            normalized_chat_type = "forum" if thread_id is not None else "group"
+
+        # Inline buttons are a second private interaction surface.  A
+        # DM-specific list is a ceiling over pairing/global authorization, so
+        # enforce it before asking the gateway runner for any broader grant.
+        dm_allowed_users = self._telegram_dm_allowed_users()
+        if normalized_chat_type == "dm" and dm_allowed_users is not None:
+            if "*" not in dm_allowed_users and normalized_user_id not in dm_allowed_users:
+                return False
+
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             try:
                 from gateway.session import SessionSource
-
-                normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
-                if normalized_chat_type == "private":
-                    normalized_chat_type = "dm"
-                elif normalized_chat_type == "supergroup":
-                    normalized_chat_type = "forum" if thread_id is not None else "group"
 
                 source = SessionSource(
                     platform=Platform.TELEGRAM,
@@ -1021,6 +1029,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Return True when Telegram auth env vars make an early decision safe."""
         keys = (
             "TELEGRAM_ALLOWED_USERS",
+            "TELEGRAM_DM_ALLOWED_USERS",
             "TELEGRAM_GROUP_ALLOWED_USERS",
             "TELEGRAM_GROUP_ALLOWED_CHATS",
             "TELEGRAM_ALLOW_ALL_USERS",
@@ -1028,6 +1037,19 @@ class TelegramAdapter(BasePlatformAdapter):
             "GATEWAY_ALLOW_ALL_USERS",
         )
         return any(os.getenv(key, "").strip() for key in keys)
+
+    def _telegram_dm_allowed_users(self) -> Optional[set[str]]:
+        """Return the optional DM-only ceiling without changing group ACLs."""
+        configured = self.config.extra.get("dm_allow_from")
+        if configured is None:
+            configured = os.getenv("TELEGRAM_DM_ALLOWED_USERS")
+        if configured is None:
+            return None
+        if isinstance(configured, str):
+            values = configured.split(",")
+        else:
+            values = configured
+        return {str(user).strip() for user in values if str(user).strip()}
 
     def _is_user_authorized_from_message(self, message: Message) -> bool:
         """Check if the sender of a Telegram message is authorized.
@@ -1048,6 +1070,13 @@ class TelegramAdapter(BasePlatformAdapter):
         # _should_process_message gating handle them.
         if not user_id:
             return True
+
+        # Narrow private intake without reducing the broader group admission
+        # list. Pairing and runner authorization cannot reopen this DM ceiling.
+        dm_allowed_users = self._telegram_dm_allowed_users()
+        if source.chat_type == "dm" and dm_allowed_users is not None:
+            if "*" not in dm_allowed_users and user_id not in dm_allowed_users:
+                return False
 
         # Adapter-level allow_from / group_allow_from: when set, they are the
         # sole authority.  Group chats use group_allow_from; DMs use allow_from.
@@ -9988,7 +10017,7 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         "reply_prefix", "reply_in_thread", "reply_to_mode",
         "unauthorized_dm_behavior", "notice_delivery", "require_mention",
         "channel_skill_bindings", "channel_prompts", "gateway_restart_notification",
-        "allow_from", "allow_admin_from", "dm_policy", "group_policy",
+        "allow_from", "dm_allow_from", "allow_admin_from", "dm_policy", "group_policy",
     }
     for _k, _v in _telegram_extra.items():
         if _k not in _GENERIC_MERGE_KEYS:

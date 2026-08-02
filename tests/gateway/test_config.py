@@ -1184,3 +1184,25 @@ class TestApiServerEnvOverride:
         assert config.platforms[Platform.API_SERVER].enabled is False
         # The key is still wired through for the shared listener.
         assert config.platforms[Platform.API_SERVER].extra.get("key") == api_server_key
+
+
+def test_bridges_discord_dm_allow_from_without_replacing_group_users(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "discord:\n"
+        "  allow_from: [\"111\", \"222\"]\n"
+        "  dm_allow_from: [\"111\"]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("DISCORD_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("DISCORD_DM_ALLOWED_USERS", raising=False)
+
+    config = load_gateway_config()
+
+    assert config.platforms[Platform.DISCORD].extra["allow_from"] == ["111", "222"]
+    assert os.environ["DISCORD_ALLOWED_USERS"] == "111,222"
+    assert os.environ["DISCORD_DM_ALLOWED_USERS"] == "111"

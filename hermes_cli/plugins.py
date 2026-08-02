@@ -171,6 +171,10 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Bounded gateway housekeeping extension point. Fired by the existing
+    # housekeeping thread every ten ticks; callbacks must stay synchronous
+    # and short. Kwargs: tick_count, interval_seconds.
+    "gateway_housekeeping_tick",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.

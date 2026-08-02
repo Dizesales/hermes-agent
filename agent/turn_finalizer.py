@@ -504,6 +504,30 @@ def finalize_turn(
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
 
+    # The initial durable write precedes delivery-only footers and transform
+    # hooks. If either changed the delivered answer, persist the canonical
+    # assistant row again so /resume replays exactly what the user saw.
+    if final_response and not interrupted:
+        try:
+            _durable_tail = messages[-1] if messages else None
+            if not isinstance(_durable_tail, dict) or _durable_tail.get("role") != "assistant":
+                messages.append({"role": "assistant", "content": final_response})
+                _durable_tail = messages[-1]
+            if _durable_tail.get("content") != final_response:
+                _durable_tail["content"] = final_response
+                _durable_tail.pop("_db_persisted", None)
+                _apply_override = getattr(agent, "_apply_persist_user_message_override", None)
+                if callable(_apply_override):
+                    _apply_override(messages)
+                agent._persist_session(messages, conversation_history)
+        except Exception as _persist_final_err:
+            _cleanup_errors.append(f"persist_final_response: {_persist_final_err}")
+            logger.error(
+                "finalize_turn: durable final-response sync failed: %s",
+                _persist_final_err,
+                exc_info=True,
+            )
+
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync

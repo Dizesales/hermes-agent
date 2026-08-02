@@ -1570,6 +1570,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["dm_policy"] = platform_cfg["dm_policy"]
                 if "allow_from" in platform_cfg:
                     bridged["allow_from"] = platform_cfg["allow_from"]
+                if "dm_allow_from" in platform_cfg:
+                    bridged["dm_allow_from"] = platform_cfg["dm_allow_from"]
                 if "allow_admin_from" in platform_cfg:
                     bridged["allow_admin_from"] = platform_cfg["allow_admin_from"]
                 if "user_allowed_commands" in platform_cfg:

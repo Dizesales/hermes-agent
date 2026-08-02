@@ -86,4 +86,19 @@ class TestCallbackAuthFailClosed:
         adapter._message_handler = None
         assert adapter._is_callback_user_authorized("12345") is True
 
+    def test_dm_specific_allowlist_precedes_global_allow_all(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_DM_ALLOWED_USERS", "12345")
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        adapter = _make_adapter()
+        adapter._message_handler = None
+
+        assert adapter._is_callback_user_authorized("67890", chat_type="private") is False
+
+    def test_dm_specific_allowlist_does_not_reduce_group_callbacks(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_DM_ALLOWED_USERS", "12345")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "12345,67890")
+        adapter = _make_adapter()
+        adapter._message_handler = None
+
+        assert adapter._is_callback_user_authorized("67890", chat_type="group") is True
 

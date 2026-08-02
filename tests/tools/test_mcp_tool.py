@@ -2626,3 +2626,32 @@ class TestMCPDiscoveryCrossProcessLock:
                 os.unlink(lock_path)
             except Exception:
                 pass
+
+
+def test_nested_oauth_failure_does_not_retry():
+    from tools.mcp_oauth import OAuthNonInteractiveError
+    from tools.mcp_tool import MCPServerTask
+
+    run_count = 0
+    nested = ExceptionGroup(
+        "unhandled errors in a TaskGroup",
+        [OAuthNonInteractiveError("callback timed out")],
+    )
+
+    async def patched_run_http(self_srv, config):
+        nonlocal run_count
+        run_count += 1
+        raise nested
+
+    async def _test():
+        server = MCPServerTask("oauth_nested")
+        with patch.object(MCPServerTask, "_run_http", patched_run_http), \
+             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await server.run({"url": "https://example.com/mcp"})
+
+        assert run_count == 1
+        assert server._error is nested
+        assert server._ready.is_set()
+        assert mock_sleep.await_count == 0
+
+    asyncio.run(_test())

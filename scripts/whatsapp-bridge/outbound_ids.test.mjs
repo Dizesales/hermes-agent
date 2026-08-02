@@ -66,3 +66,40 @@ test('rejects non-positive maxSize', () => {
   assert.throws(() => createOutboundIdTracker(-1), RangeError);
   assert.throws(() => createOutboundIdTracker(1.5), RangeError);
 });
+
+test('delivery tracker waits for a matching provider receipt', async () => {
+  const tracker = createOutboundIdTracker();
+  tracker.remember('msg-1');
+  const waiting = tracker.waitFor('msg-1', 1000);
+  assert.equal(tracker.observe('messages.update', {
+    key: { id: 'msg-1', remoteJid: '15551234567@s.whatsapp.net', fromMe: true },
+    update: { status: 3 },
+  }), true);
+  assert.deepEqual(await waiting, {
+    observed: true,
+    source: 'messages.update',
+    statusBucket: 'accepted_or_delivered',
+    updateCount: 1,
+  });
+});
+
+test('delivery tracker does not confirm pending or unrelated updates', async () => {
+  const tracker = createOutboundIdTracker();
+  tracker.remember('msg-1');
+  assert.equal(tracker.observe('messages.update', { key: { id: 'other' }, update: { status: 3 } }), false);
+  assert.equal(tracker.observe('messages.update', { key: { id: 'msg-1' }, update: { status: 1 } }), false);
+  assert.deepEqual(await tracker.waitFor('msg-1', 0), {
+    observed: false,
+    source: null,
+    statusBucket: 'pending',
+    updateCount: 1,
+  });
+});
+
+test('delivery tracker times out without inventing confirmation', async () => {
+  const tracker = createOutboundIdTracker();
+  tracker.remember('msg-1');
+  const status = await tracker.waitFor('msg-1', 1);
+  assert.equal(status.observed, false);
+  assert.equal(status.statusBucket, 'timeout');
+});

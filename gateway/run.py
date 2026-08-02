@@ -76,6 +76,7 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
+_SYNTHETIC_EVENT_NO_ROUTE = object()
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
@@ -13634,7 +13635,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not is_internal:
             try:
                 from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-                _hook_results = _invoke_hook(
+                _raw_hook_results = _invoke_hook(
                     "pre_gateway_dispatch",
                     event=event,
                     gateway=self,
@@ -13643,6 +13644,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # hook must not fail dispatch over a missing attribute.
                     session_store=getattr(self, "session_store", None),
                 )
+                _hook_results = []
+                for _hook_result in _raw_hook_results:
+                    try:
+                        if inspect.isawaitable(_hook_result):
+                            _hook_result = await _hook_result
+                    except Exception as _async_hook_exc:
+                        logger.warning(
+                            "pre_gateway_dispatch async hook result failed: %s",
+                            _async_hook_exc,
+                        )
+                        continue
+                    _hook_results.append(_hook_result)
             except Exception as _hook_exc:
                 logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
                 _hook_results = []
@@ -20810,15 +20823,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict,
-    ) -> Optional[bool]:
+    ) -> object:
         """Inject a watch/completion notification as a synthetic message event.
 
         Routing must come from the queued event itself, not from whatever
         foreground message happened to be active when the queue was drained.
         Returns ``True`` after adapter acceptance, ``False`` after a retryable
-        adapter failure, and ``None`` when the event has no gateway route. This
-        is not a transactional boundary: a process crash after adapter
-        acceptance can still cause durable at-least-once replay.
+        adapter failure, ``None`` when routing exists but its adapter is not
+        active, and ``_SYNTHETIC_EVENT_NO_ROUTE`` when the event itself has no
+        resolvable gateway route. This is not a transactional boundary: a
+        process crash after adapter acceptance can still cause durable
+        at-least-once replay.
         """
         source = self._build_process_event_source(evt)
         if not source:
@@ -20829,7 +20844,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Recover the raw session id and wake the real session via the API
             # server's own /v1/chat/completions entry point instead of
             # dropping the event.
-            raw_sid = str(evt.get("origin_session_id") or "").strip()
+            explicit_raw_sid = str(evt.get("origin_session_id") or "").strip()
+            raw_sid = explicit_raw_sid
             if not raw_sid:
                 _sk = str(evt.get("session_key") or "").strip()
                 if _sk and _parse_session_key(_sk) is None:
@@ -20858,12 +20874,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "api_server adapter to self-post through",
                     raw_sid,
                 )
-                return None
+                # Explicit API origins remain retryable until their adapter
+                # returns. Opaque session keys are also used by CLI/desktop;
+                # without that explicit origin they have no gateway route and
+                # must not replay on every gateway boot.
+                if explicit_raw_sid:
+                    return None
+                return _SYNTHETIC_EVENT_NO_ROUTE
             logger.warning(
                 "Dropping watch notification with no routing metadata for process %s",
                 evt.get("session_id", "unknown"),
             )
-            return None
+            return _SYNTHETIC_EVENT_NO_ROUTE
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         adapter = None
         for p, a in self.adapters.items():
@@ -21081,6 +21103,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         accepted = False
         try:
             injection_result = await self._inject_watch_notification(synth_text, evt)
+            if injection_result is _SYNTHETIC_EVENT_NO_ROUTE:
+                # CLI/desktop-origin delegations legitimately have no gateway
+                # destination. Their durable result remains queryable in
+                # state.db, but leaving delivery_state=pending restores and
+                # reclaims the same impossible delivery on every gateway boot.
+                # Terminally acknowledge that disposition so it is dropped
+                # once instead of replayed forever.
+                if durable_claim_id:
+                    try:
+                        from tools.async_delegation import complete_completion_delivery
+
+                        complete_completion_delivery(
+                            durable_delegation_id, durable_claim_id,
+                        )
+                        durable_claim_id = ""
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not acknowledge unroutable async completion %s: %s",
+                            durable_delegation_id, exc,
+                        )
+                        return False
+                return None
             if injection_result is not True:
                 return injection_result
             accepted = True
@@ -24796,6 +24840,7 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
     AUTO_ARCHIVE_EVERY = 60  # ticks — poll hourly (state_meta gate owns the real cadence)
+    PLUGIN_HOOK_EVERY = 10   # ticks — bounded extension point for local plugins
 
     # Every platform media cache prunes on the same hourly cadence — one loop
     # over (name, cleanup_fn), not a copy-pasted try/except per cache.
@@ -24903,6 +24948,18 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
                         _adb.close()
             except Exception as e:
                 logger.debug("Auto-archive tick error: %s", e)
+
+        if tick_count % PLUGIN_HOOK_EVERY == 0:
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+                _invoke_hook(
+                    "gateway_housekeeping_tick",
+                    tick_count=tick_count,
+                    interval_seconds=interval,
+                )
+            except Exception as e:
+                logger.debug("Gateway housekeeping plugin tick error: %s", e)
 
         stop_event.wait(timeout=interval)
     logger.info("Gateway housekeeping stopped")

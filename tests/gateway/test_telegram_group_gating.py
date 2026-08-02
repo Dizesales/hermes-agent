@@ -882,3 +882,27 @@ def test_identity_freshness_does_not_depend_on_host_uptime(monkeypatch):
 
     adapter._note_bot_username("new_helper_bot")
     assert adapter._bot_identity_is_fresh() is True
+
+
+def test_config_preserves_telegram_dm_allow_from_separately(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "telegram:\n"
+        "  allow_from: [\"111\", \"222\"]\n"
+        "  dm_allow_from: [\"111\"]\n"
+        "  group_allow_from: [\"111\", \"222\"]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("TELEGRAM_DM_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("TELEGRAM_GROUP_ALLOWED_USERS", raising=False)
+
+    config = load_gateway_config()
+
+    telegram = config.platforms[Platform.TELEGRAM]
+    assert telegram.extra["allow_from"] == ["111", "222"]
+    assert telegram.extra["dm_allow_from"] == ["111"]
+    assert __import__("os").environ["TELEGRAM_ALLOWED_USERS"] == "111,222"
+    assert "TELEGRAM_DM_ALLOWED_USERS" not in __import__("os").environ

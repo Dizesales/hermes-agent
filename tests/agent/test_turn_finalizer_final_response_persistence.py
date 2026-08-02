@@ -178,5 +178,35 @@ def test_final_response_fills_pure_tool_call_tail(monkeypatch):
     assert sum(1 for m in persisted if m.get("role") == "assistant") == 1
 
 
+def test_transformed_response_is_the_durable_assistant_turn(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda name, **_kw: ["Canonical reply"] if name == "transform_llm_output" else [],
+    )
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "oi"},
+        {"role": "assistant", "content": "Raw model draft"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="Raw model draft",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="oi",
+        original_user_message="oi",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == "Canonical reply"
+    assert result["messages"][-1]["content"] == "Canonical reply"
+    assert agent.persisted_messages[-1]["content"] == "Canonical reply"
 
 

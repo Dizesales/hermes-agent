@@ -4,10 +4,11 @@ The manager consolidates the eight scattered MCP-OAuth call sites into a
 single object with disk-mtime watch, dedup'd 401 handling, and a provider
 cache. See `tools/mcp_oauth_manager.py` for design rationale.
 """
+import asyncio
 import json
 import os
 import time
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -285,6 +286,58 @@ def test_invalid_client_at_token_endpoint_poisons(tmp_path, monkeypatch):
     assert (d / "srv.client.json.bak").exists()
     assert provider._initialized is False
     assert provider.context.client_info is None
+
+
+@pytest.mark.asyncio
+async def test_provider_serializes_concurrent_auth_flows(tmp_path, monkeypatch):
+    import httpx
+    import tools.mcp_oauth_manager as manager_module
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    provider = MCPOAuthManager().get_or_build_provider(
+        "srv", "https://example.com/mcp", None
+    )
+    assert provider is not None
+
+    entered = 0
+    release_first = asyncio.Event()
+
+    async def fake_parent_flow(self, request):
+        nonlocal entered
+        entered += 1
+        if entered == 1:
+            await release_first.wait()
+        yield request
+
+    fake_manager = MagicMock()
+    fake_manager.invalidate_if_disk_changed = AsyncMock(return_value=False)
+    base = provider.__class__.__bases__[0]
+
+    with patch.object(base, "async_auth_flow", new=fake_parent_flow), \
+         patch.object(manager_module, "get_manager", return_value=fake_manager):
+        req1 = httpx.Request("GET", "https://example.com/one")
+        req2 = httpx.Request("GET", "https://example.com/two")
+        flow1 = provider.async_auth_flow(req1)
+        flow2 = provider.async_auth_flow(req2)
+
+        first = asyncio.create_task(flow1.__anext__())
+        await asyncio.sleep(0)
+        second = asyncio.create_task(flow2.__anext__())
+        await asyncio.sleep(0)
+        assert entered == 1
+        assert not second.done()
+
+        release_first.set()
+        assert await first is req1
+        with pytest.raises(StopAsyncIteration):
+            await flow1.asend(httpx.Response(200, request=req1))
+
+        assert await asyncio.wait_for(second, timeout=1) is req2
+        assert entered == 2
+        with pytest.raises(StopAsyncIteration):
+            await flow2.asend(httpx.Response(200, request=req2))
 
 
 def test_invalid_client_metadata_does_not_trip(tmp_path, monkeypatch):

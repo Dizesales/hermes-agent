@@ -1444,11 +1444,11 @@ def interrupt_for_session(
 
 
 def _reset_for_tests() -> None:
-    """Test-only: clear all state and tear down the executor + monitor."""
+    """Test-only: join workers, then clear state without late queue writes."""
     global _executor, _executor_max_workers, _monitor_thread
     with _executor_lock:
         if _executor is not None:
-            _executor.shutdown(wait=False)
+            _executor.shutdown(wait=True, cancel_futures=True)
         _executor = None
         _executor_max_workers = 0
     _monitor_stop.set()
