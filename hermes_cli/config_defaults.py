@@ -2783,6 +2783,11 @@ DEFAULT_CONFIG = {
         #               ignored paths — node_modules, venv, build outputs —
         #               are never touched.
         "non_interactive_local_changes": "stash",
+        # Sync bundled skills, credential backfills, and memory-provider host
+        # blocks into named profiles after an update. Disable this on fleet
+        # owner hosts where named profiles are read-only projections of
+        # runtimes owned by other machines.
+        "sync_named_profiles": True,
         # Refresh an already-installed cua-driver during `hermes update`.
         # The refresh is best-effort and macOS-only. Turn this off if the
         # upstream installer is not appropriate for the machine, for example

@@ -42,6 +42,38 @@ from hermes_constants import venv_python_path
 logger = logging.getLogger(__name__)
 
 
+def _sync_named_profiles_on_update_enabled() -> bool:
+    """Whether an update may mutate named profiles on this host.
+
+    Upstream defaults to syncing bundled skills and backfilling credentials
+    across every local profile.  Fleet-owner hosts can keep named profiles as
+    read-only projections of runtimes owned elsewhere, so they need an
+    explicit host-local off switch.  Fail open to the upstream default when
+    config cannot be read; only an explicit false value narrows the update.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+        updates = config.get("updates", {})
+        if not isinstance(updates, dict):
+            return True
+        raw = updates.get("sync_named_profiles", True)
+    except Exception as exc:
+        logger.debug("Could not read updates.sync_named_profiles: %s", exc)
+        return True
+
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in {"false", "no", "off", "0"}:
+            return False
+        if normalized in {"true", "yes", "on", "1"}:
+            return True
+    return True
+
+
 def _m():
     """Lazy ``hermes_cli.main`` reference.
 
@@ -4374,71 +4406,76 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as e:
             logger.debug("Skills sync during update failed: %s", e)
 
-        # Sync bundled skills to all profiles (including the active one).
-        # seed_profile_skills() uses subprocess with an explicit HERMES_HOME so
-        # it is not affected by sync_skills()'s module-level HERMES_HOME cache,
-        # which means the active profile is reliably synced regardless of whether
-        # the caller's HERMES_HOME env var points at the default or a named profile.
-        try:
-            from hermes_cli.profiles import (
-                list_profiles,
-                seed_profile_skills,
-            )
-
-            all_profiles = list_profiles()
-            if all_profiles:
-                print()
-                print("→ Syncing bundled skills to all profiles...")
-                for p in all_profiles:
-                    try:
-                        r = seed_profile_skills(p.path, quiet=True)
-                        if r and r.get("skipped_opt_out"):
-                            status = "opted out (--no-skills)"
-                        elif r:
-                            copied = len(r.get("copied", []))
-                            updated = len(r.get("updated", []))
-                            modified = len(r.get("user_modified", []))
-                            parts = []
-                            if copied:
-                                parts.append(f"+{copied} new")
-                            if updated:
-                                parts.append(f"↑{updated} updated")
-                            if modified:
-                                parts.append(f"~{modified} user-modified")
-                            status = ", ".join(parts) if parts else "up to date"
-                        else:
-                            status = "sync failed"
-                        print(f"  {p.name}: {status}")
-                    except Exception as pe:
-                        print(f"  {p.name}: error ({pe})")
-        except Exception:
-            pass  # profiles module not available or no profiles
-
-        # Backfill per-profile .env files for profiles created before the
-        # .env-seeding fix (#44792). Copies the default install's .env so
-        # those profiles keep the credentials they were effectively using.
-        try:
-            from hermes_cli.profiles import backfill_profile_envs
-
-            backfilled = backfill_profile_envs(quiet=True)
-            if backfilled:
-                print()
-                print(
-                    f"→ Seeded .env for {len(backfilled)} profile(s) "
-                    f"(copied from default): {', '.join(backfilled)}"
+        if _sync_named_profiles_on_update_enabled():
+            # Sync bundled skills to all profiles (including the active one).
+            # seed_profile_skills() uses subprocess with an explicit
+            # HERMES_HOME so it is not affected by sync_skills()'s module-level
+            # cache.
+            try:
+                from hermes_cli.profiles import (
+                    list_profiles,
+                    seed_profile_skills,
                 )
-        except Exception:
-            pass  # profiles module not available or no profiles
 
-        # Sync Honcho host blocks to all profiles
-        try:
-            from plugins.memory.honcho.cli import sync_honcho_profiles_quiet
+                all_profiles = list_profiles()
+                if all_profiles:
+                    print()
+                    print("→ Syncing bundled skills to all profiles...")
+                    for p in all_profiles:
+                        try:
+                            r = seed_profile_skills(p.path, quiet=True)
+                            if r and r.get("skipped_opt_out"):
+                                status = "opted out (--no-skills)"
+                            elif r:
+                                copied = len(r.get("copied", []))
+                                updated = len(r.get("updated", []))
+                                modified = len(r.get("user_modified", []))
+                                parts = []
+                                if copied:
+                                    parts.append(f"+{copied} new")
+                                if updated:
+                                    parts.append(f"↑{updated} updated")
+                                if modified:
+                                    parts.append(f"~{modified} user-modified")
+                                status = ", ".join(parts) if parts else "up to date"
+                            else:
+                                status = "sync failed"
+                            print(f"  {p.name}: {status}")
+                        except Exception as pe:
+                            print(f"  {p.name}: error ({pe})")
+            except Exception:
+                pass  # profiles module not available or no profiles
 
-            synced = sync_honcho_profiles_quiet()
-            if synced:
-                print(f"\n-> Honcho: synced {synced} profile(s)")
-        except Exception:
-            pass  # honcho plugin not installed or not configured
+            # Backfill per-profile .env files for profiles created before the
+            # .env-seeding fix (#44792).
+            try:
+                from hermes_cli.profiles import backfill_profile_envs
+
+                backfilled = backfill_profile_envs(quiet=True)
+                if backfilled:
+                    print()
+                    print(
+                        f"→ Seeded .env for {len(backfilled)} profile(s) "
+                        f"(copied from default): {', '.join(backfilled)}"
+                    )
+            except Exception:
+                pass  # profiles module not available or no profiles
+
+            # Sync Honcho host blocks to all profiles.
+            try:
+                from plugins.memory.honcho.cli import sync_honcho_profiles_quiet
+
+                synced = sync_honcho_profiles_quiet()
+                if synced:
+                    print(f"\n-> Honcho: synced {synced} profile(s)")
+            except Exception:
+                pass  # honcho plugin not installed or not configured
+        else:
+            print()
+            print(
+                "→ Named-profile update sync skipped "
+                "(updates.sync_named_profiles=false)"
+            )
 
         # Check for config migrations
         print()
