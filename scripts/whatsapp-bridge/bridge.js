@@ -37,6 +37,8 @@ import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
   buildPollPayload,
+  createReconnectScheduler,
+  createVersionResolver,
   buildLocationPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
@@ -396,12 +398,15 @@ function emitPairEvent(event) {
   } catch {}
 }
 
+const scheduleReconnect = createReconnectScheduler(() => startSocket());
+const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
+
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+  const version = await getWAVersion();
 
   sock = makeWASocket({
-    version,
+    ...(version ? { version } : {}),
     auth: state,
     logger,
     printQRInTerminal: false,
@@ -452,7 +457,7 @@ async function startSocket() {
             console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
           }
         }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
+        scheduleReconnect(reason === 515 ? 1000 : 3000);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
@@ -1186,6 +1191,6 @@ if (PAIR_ONLY) {
       console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
     }
     console.log();
-    startSocket();
+    scheduleReconnect(0);
   });
 }

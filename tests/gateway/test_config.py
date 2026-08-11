@@ -1203,6 +1203,10 @@ def test_bridges_discord_dm_allow_from_without_replacing_group_users(
 
     config = load_gateway_config()
 
-    assert config.platforms[Platform.DISCORD].extra["allow_from"] == ["111", "222"]
+    # v0.20 normalizes Discord profile gates to CSV strings in
+    # ``PlatformConfig.extra`` so each adapter can consume a profile-local
+    # snapshot without falling back to process-global environment state.
+    assert config.platforms[Platform.DISCORD].extra["allow_from"] == "111,222"
+    assert config.platforms[Platform.DISCORD].extra["dm_allow_from"] == "111"
     assert os.environ["DISCORD_ALLOWED_USERS"] == "111,222"
     assert os.environ["DISCORD_DM_ALLOWED_USERS"] == "111"
