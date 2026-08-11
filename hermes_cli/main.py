@@ -5888,6 +5888,16 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     _say("  ✓ Web UI built")
     project_root = web_dir.parent.parent if web_dir.parent.name == "apps" else web_dir.parent
     _write_web_ui_build_stamp(project_root, web_dir)
+    # The scoped npm ci above recreates the workspace-root node_modules and
+    # therefore removes the TUI fingerprint recorded by the updater moments
+    # earlier. Restore it only after the shared dependency tree and web build
+    # both succeeded, so the next TUI launch does not reinstall needlessly.
+    tui_dir = project_root / "ui-tui"
+    if (tui_dir / "package.json").is_file():
+        _record_tui_install_fingerprint(
+            tui_dir,
+            include_workspace_root=not _is_termux_startup_environment(),
+        )
     return True
 
 

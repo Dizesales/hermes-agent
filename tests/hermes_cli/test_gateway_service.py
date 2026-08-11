@@ -188,6 +188,30 @@ class TestGeneratedSystemdUnits:
         timeout = int(max(60, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT + 30))
         return f"TimeoutStopSec={timeout}"
 
+    def test_managed_node_suppresses_ambient_node_fallback(self, tmp_path, monkeypatch):
+        import hermes_constants
+
+        managed_bin = tmp_path / "managed-node" / "bin"
+        managed_bin.mkdir(parents=True)
+        ambient_bin = tmp_path / "ambient-node"
+        ambient_bin.mkdir()
+
+        monkeypatch.setattr(
+            hermes_constants,
+            "iter_hermes_node_dirs",
+            lambda _root=None: iter((managed_bin,)),
+        )
+        monkeypatch.setattr(
+            gateway_cli.shutil,
+            "which",
+            lambda cmd: str(ambient_bin / "node") if cmd == "node" else None,
+        )
+
+        path_entries = []
+        gateway_cli._append_node_dir_for_service(path_entries, tmp_path)
+
+        assert path_entries == [str(managed_bin)]
+
 
 
     def test_user_unit_does_not_leak_profile_node_symlink_target(self, tmp_path, monkeypatch):
@@ -1759,4 +1783,3 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         )
         assert ok is True
         assert attempts["bootstrap"] >= 2  # the timeout was retried, not raised
-

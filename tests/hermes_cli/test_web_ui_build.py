@@ -24,6 +24,7 @@ from hermes_cli.main import (
     _compute_web_ui_content_hash,
     _missing_web_build_tool,
     _run_npm_install_deterministic,
+    _tui_need_npm_install,
     _web_build_toolchain_ready,
     _web_toolchain_roots,
     _web_ui_stamp_path,
@@ -190,6 +191,9 @@ class TestBuildWebUISkipsWhenFresh:
             "--prefer-offline",
         ]
         assert kwargs["cwd"] == tmp_path
+        assert not _tui_need_npm_install(
+            tui_dir, include_workspace_root=True
+        )
 
     def test_web_build_uses_idle_timeout_helper(self, tmp_path):
         """npm run build now goes through _run_with_idle_timeout (issue #33788).
