@@ -5791,13 +5791,26 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
                 _say(text)
 
     npm_cwd = _workspace_root(web_dir)
-    # Scope the install to the web workspace only so that the full workspace
+    # Scope the install to the runtime workspaces so that the full workspace
     # graph (including apps/desktop with its Electron + node-pty deps) is never
-    # resolved here.  Without --workspace the root package.json's apps/* glob
-    # would pull in desktop on every web build. See #38772.
+    # resolved here.  Keep the root and TUI in the selection: npm 12 prunes
+    # dependencies belonging to omitted workspaces during a scoped ``npm ci``.
+    # A web-only refresh after _update_node_dependencies() therefore removed
+    # agent-browser and the TUI graph even though both had just been installed.
+    # See #38772 and the matching selection in _update_node_dependencies().
     # When web/ has its own package-lock.json, _workspace_root() returns
     # web_dir itself and --workspace would fail.  See #42973.
-    npm_workspace_args: tuple[str, ...] = () if npm_cwd == web_dir else ("--workspace", "web")
+    npm_workspace_args: tuple[str, ...] = (
+        ()
+        if npm_cwd == web_dir
+        else (
+            "--workspace",
+            "ui-tui",
+            "--workspace",
+            "web",
+            "--include-workspace-root",
+        )
+    )
     if _is_termux_startup_environment():
         npm_cwd, npm_workspace_args = _termux_workspace_install_context(web_dir)
 

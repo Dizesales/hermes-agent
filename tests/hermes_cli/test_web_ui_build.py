@@ -153,6 +153,44 @@ class TestBuildWebUISkipsWhenFresh:
         assert args[0] == ["/usr/bin/npm", "ci", "--include=dev", "--silent", "--prefer-offline"]
         assert kwargs["cwd"] == web_dir
 
+    def test_monorepo_web_install_preserves_root_and_tui_workspaces(
+        self, tmp_path, monkeypatch
+    ):
+        """A scoped npm 12 install must not prune root or TUI dependencies."""
+        web_dir, _ = _make_web_dir(tmp_path)
+        (tmp_path / "package.json").write_text(
+            '{"workspaces":["ui-tui","web"]}', encoding="utf-8"
+        )
+        (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
+        tui_dir = tmp_path / "ui-tui"
+        tui_dir.mkdir()
+        (tui_dir / "package.json").write_text("{}", encoding="utf-8")
+        monkeypatch.delenv("TERMUX_VERSION", raising=False)
+        monkeypatch.setenv("PREFIX", "/usr")
+
+        install_cp = __import__("subprocess").CompletedProcess([], 0, stdout="", stderr="")
+        build_cp = __import__("subprocess").CompletedProcess([], 0, stdout="", stderr="")
+        with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+             patch("hermes_cli.main.subprocess.run", return_value=install_cp) as mock_run, \
+             patch("hermes_cli.main._run_with_idle_timeout", return_value=build_cp):
+            result = _build_web_ui(web_dir)
+
+        assert result is True
+        args, kwargs = mock_run.call_args
+        assert args[0] == [
+            "/usr/bin/npm",
+            "ci",
+            "--include=dev",
+            "--workspace",
+            "ui-tui",
+            "--workspace",
+            "web",
+            "--include-workspace-root",
+            "--silent",
+            "--prefer-offline",
+        ]
+        assert kwargs["cwd"] == tmp_path
+
     def test_web_build_uses_idle_timeout_helper(self, tmp_path):
         """npm run build now goes through _run_with_idle_timeout (issue #33788).
 
@@ -367,4 +405,3 @@ class TestBuildRecoversFromMissingToolchain:
         assert result is True
         assert mock_install.call_count == 1
         assert mock_build.call_count == 1
-
