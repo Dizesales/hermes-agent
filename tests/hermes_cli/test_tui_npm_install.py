@@ -1,5 +1,6 @@
 """_tui_need_npm_install: auto npm when node_modules is behind the lockfile."""
 
+import json
 import os
 import types
 from pathlib import Path
@@ -26,10 +27,107 @@ def _touch_tui_entry(root: Path) -> None:
     entry.write_text("console.log('tui')")
 
 
+def _write_package(path: Path, package: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(package), encoding="utf-8")
+
+
 def _assert_utf8_replace_capture(kwargs: dict) -> None:
     assert kwargs["text"] is True
     assert kwargs["encoding"] == "utf-8"
     assert kwargs["errors"] == "replace"
+
+
+def test_tui_fingerprint_ignores_unselected_workspace_and_checks_root_deps(
+    tmp_path: Path, main_mod
+) -> None:
+    tui_dir = tmp_path / "ui-tui"
+    _write_package(
+        tmp_path / "package.json",
+        {
+            "dependencies": {"agent-browser": "1.0.0"},
+            "devDependencies": {"@eslint/js": "1.0.0"},
+        },
+    )
+    _write_package(
+        tui_dir / "package.json",
+        {"dependencies": {"@hermes/ink": "file:./packages/hermes-ink"}},
+    )
+    _write_package(tui_dir / "packages/hermes-ink/package.json", {})
+    _write_package(
+        tmp_path / "apps/bootstrap-installer/package.json",
+        {"dependencies": {"intentionally-skipped": "1.0.0"}},
+    )
+    (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
+
+    for package_name in ("agent-browser", "@eslint/js", "@hermes/ink"):
+        _write_package(
+            tmp_path / "node_modules" / package_name / "package.json", {}
+        )
+
+    assert main_mod._record_tui_install_fingerprint(
+        tui_dir, include_workspace_root=True
+    )
+    assert not main_mod._tui_need_npm_install(
+        tui_dir, include_workspace_root=True
+    )
+
+    _write_package(
+        tmp_path / "apps/bootstrap-installer/package.json",
+        {"dependencies": {"still-skipped": "2.0.0"}},
+    )
+    assert not main_mod._tui_need_npm_install(
+        tui_dir, include_workspace_root=True
+    )
+
+    (tmp_path / "node_modules/agent-browser/package.json").unlink()
+    assert main_mod._tui_need_npm_install(
+        tui_dir, include_workspace_root=True
+    )
+
+
+def test_tui_fingerprint_is_invalidated_by_lockfile_change(
+    tmp_path: Path, main_mod
+) -> None:
+    tui_dir = tmp_path / "ui-tui"
+    _write_package(tmp_path / "package.json", {})
+    _write_package(tui_dir / "package.json", {})
+    lock = tmp_path / "package-lock.json"
+    lock.write_text("{}", encoding="utf-8")
+
+    assert main_mod._record_tui_install_fingerprint(
+        tui_dir, include_workspace_root=True
+    )
+    assert not main_mod._tui_need_npm_install(
+        tui_dir, include_workspace_root=True
+    )
+
+    lock.write_text('{"changed": true}', encoding="utf-8")
+    assert main_mod._tui_need_npm_install(
+        tui_dir, include_workspace_root=True
+    )
+
+
+def test_tui_source_without_lockfile_still_repairs_missing_dependencies(
+    tmp_path: Path, main_mod
+) -> None:
+    _write_package(
+        tmp_path / "package.json",
+        {"dependencies": {"@hermes/ink": "1.0.0"}},
+    )
+
+    assert main_mod._tui_need_npm_install(
+        tmp_path, include_workspace_root=True
+    )
+    _write_package(
+        tmp_path / "node_modules/@hermes/ink/package.json", {}
+    )
+    assert main_mod._record_tui_install_fingerprint(
+        tmp_path, include_workspace_root=True
+    )
+    assert not main_mod._tui_need_npm_install(
+        tmp_path, include_workspace_root=True
+    )
 
 
 
@@ -174,5 +272,42 @@ def test_make_tui_argv_omits_workspace_when_tui_has_own_lockfile(
         f"npm install should omit --workspace when tui_dir has its own lockfile, got: {install_cmd}"
     )
     assert install_cmd[:2] == ["/bin/npm", "install"]
+    assert "--no-save" in install_cmd
     # cwd must be tui_dir (standalone), not parent
     assert calls[0][1]["cwd"] == str(tui_dir)
+
+
+def test_make_tui_argv_repairs_workspace_root_without_saving_lockfile(
+    tmp_path: Path, main_mod, monkeypatch
+) -> None:
+    tui_dir = tmp_path / "ui-tui"
+    _write_package(tmp_path / "package.json", {})
+    _write_package(tui_dir / "package.json", {})
+    (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.delenv("TERMUX_VERSION", raising=False)
+    monkeypatch.setenv("PREFIX", "/usr")
+    monkeypatch.setattr(main_mod, "_ensure_tui_node", lambda: None)
+    monkeypatch.setattr(main_mod, "_ensure_tui_workspace", lambda _root: None)
+    monkeypatch.setattr(main_mod, "_find_bundled_tui", lambda: None)
+    monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: True)
+    monkeypatch.setattr(
+        main_mod, "_record_tui_install_fingerprint", lambda *a, **k: True
+    )
+    monkeypatch.setattr(main_mod.shutil, "which", lambda name: f"/bin/{name}")
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
+
+    main_mod._make_tui_argv(tui_dir, tui_dev=False)
+
+    install_cmd = calls[0][0][0]
+    assert install_cmd[:3] == ["/bin/npm", "install", "--no-save"]
+    assert "--workspace" in install_cmd
+    assert "ui-tui" in install_cmd
+    assert "--include-workspace-root" in install_cmd
+    assert calls[0][1]["cwd"] == str(tmp_path)

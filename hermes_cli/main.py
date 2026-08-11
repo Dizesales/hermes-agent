@@ -1590,17 +1590,7 @@ def _print_tui_exit_summary(
     )
 
 
-_NPM_LOCK_RUNTIME_KEYS = frozenset({"ideallyInert", "peer"})
-"""Lockfile fields npm writes non-deterministically at install time.
-
-``ideallyInert`` is npm's runtime annotation for packages it skipped installing
-(per-platform opt-outs).  ``peer`` is dropped from the hidden ``.package-lock.json``
-on dev-dependencies that are *also* declared as peers — the canonical
-``package-lock.json`` records the dual role, but npm 9's actualized tree strips
-it.  Neither key represents a real skew between what was declared and what was
-installed, so we exclude them from the comparison in :func:`_tui_need_npm_install`
-to avoid false-positive reinstalls on every launch.
-"""
+_TUI_INSTALL_FINGERPRINT = ".hermes-tui-install-fingerprint"
 
 
 def _workspace_root(dir: Path) -> Path:
@@ -1656,36 +1646,156 @@ def _termux_workspace_install_context(
     return ws_root, tuple(workspace_args)
 
 
-def _tui_need_npm_install(root: Path) -> bool:
-    """True when @hermes/ink is missing or node_modules is behind package-lock.json.
+def _tui_install_manifest_paths(
+    root: Path, *, include_workspace_root: bool
+) -> tuple[Path, ...] | None:
+    """Return manifests that define the selected TUI install graph."""
+    ws_root = _workspace_root(root).resolve()
+    root = root.resolve()
+    pending = [root / "package.json"]
+    if include_workspace_root and ws_root != root:
+        pending.append(ws_root / "package.json")
+
+    manifests: set[Path] = set()
+    while pending:
+        manifest = pending.pop()
+        if manifest in manifests:
+            continue
+        try:
+            package = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(package, dict):
+            return None
+        manifests.add(manifest)
+
+        for section in ("dependencies", "devDependencies"):
+            dependencies = package.get(section) or {}
+            if not isinstance(dependencies, dict):
+                return None
+            for spec in dependencies.values():
+                if isinstance(spec, str) and spec.startswith("file:"):
+                    pending.append(
+                        (manifest.parent / spec.removeprefix("file:")).resolve()
+                        / "package.json"
+                    )
+
+    return tuple(sorted(manifests))
+
+
+def _resolve_installed_dependency(
+    ws_root: Path, manifest_dir: Path, package_name: str
+) -> Path | None:
+    """Resolve an installed package using Node's ancestor lookup order."""
+    current = manifest_dir.resolve()
+    boundary = ws_root.resolve()
+    while True:
+        candidate = current / "node_modules" / package_name / "package.json"
+        if candidate.is_file():
+            return candidate
+        if current == boundary or boundary not in current.parents:
+            return None
+        current = current.parent
+
+
+def _tui_dependency_tree_ready(
+    root: Path, *, include_workspace_root: bool
+) -> bool:
+    """Check that direct dependencies for the selected install exist."""
+    ws_root = _workspace_root(root).resolve()
+    manifests = _tui_install_manifest_paths(
+        root, include_workspace_root=include_workspace_root
+    )
+    if manifests is None:
+        return False
+
+    for manifest in manifests:
+        try:
+            package = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        for section in ("dependencies", "devDependencies"):
+            dependencies = package.get(section) or {}
+            if not isinstance(dependencies, dict):
+                return False
+            for package_name in dependencies:
+                if _resolve_installed_dependency(
+                    ws_root, manifest.parent, package_name
+                ) is None:
+                    return False
+    return True
+
+
+def _tui_install_fingerprint(
+    root: Path, *, include_workspace_root: bool
+) -> str | None:
+    """Hash the lockfile and manifests for the selected TUI install graph."""
+    ws_root = _workspace_root(root).resolve()
+    lock = ws_root / "package-lock.json"
+    manifests = _tui_install_manifest_paths(
+        root, include_workspace_root=include_workspace_root
+    )
+    if manifests is None:
+        return None
+
+    digest = hashlib.sha256()
+    inputs = ((lock,) if lock.is_file() else ()) + manifests
+    for path in inputs:
+        try:
+            payload = path.read_bytes()
+            relative = path.relative_to(ws_root).as_posix().encode()
+        except (OSError, ValueError):
+            return None
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
+
+
+def _record_tui_install_fingerprint(
+    root: Path, *, include_workspace_root: bool
+) -> bool:
+    """Record a successful, complete TUI install as an atomic postcondition."""
+    if not _tui_dependency_tree_ready(
+        root, include_workspace_root=include_workspace_root
+    ):
+        return False
+    fingerprint = _tui_install_fingerprint(
+        root, include_workspace_root=include_workspace_root
+    )
+    if fingerprint is None:
+        return False
+
+    marker = _workspace_root(root) / "node_modules" / _TUI_INSTALL_FINGERPRINT
+    pending = marker.with_suffix(".tmp")
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        pending.write_text(fingerprint, encoding="utf-8")
+        os.replace(pending, marker)
+    except OSError:
+        try:
+            pending.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _tui_need_npm_install(
+    root: Path, *, include_workspace_root: bool | None = None
+) -> bool:
+    """True when the selected TUI dependency graph is stale or incomplete.
 
     Prebuilt bundle mode: when ``dist/entry.js`` exists and there is no
     ``package-lock.json`` (nix install layout only ships ``dist/`` +
     ``package.json``), skip reinstall entirely — the bundle is self-contained
     and there is nothing to install.
 
-    With npm workspaces the single ``package-lock.json`` and the hoisted
-    ``node_modules/`` live at the workspace root (the parent of the
-    ``ui-tui/`` directory).  The lockfile / ink / marker checks use that
-    workspace root; only the prebuilt-bundle sentinel stays relative to
-    *root* (``ui-tui/dist/entry.js``).
-
-    Compares ``package-lock.json`` against ``node_modules/.package-lock.json``
-    (npm's hidden lockfile) by **content**, not mtime: git checkouts and npm
-    rewrites can bump the root lockfile's timestamp even when installed deps
-    already match, which used to trigger a spurious "Installing TUI
-    dependencies" on every launch.
-
-    For each entry in the root lock's ``packages`` map:
-      - missing from hidden lock → reinstall (unless the entry is marked
-        ``optional`` or ``peer``, which npm may intentionally skip per platform)
-      - present but with differing fields (excluding npm-written runtime
-        annotations like ``ideallyInert``) → reinstall
-
-    Extra entries that exist only in the hidden lock are ignored — stale
-    transitives left over from a removed dependency don't break runtime and
-    we'd rather not force a reinstall for them. Falls back to mtime
-    comparison if either lockfile is unparseable.
+    The marker is scoped to the root + TUI manifests (or only the TUI graph on
+    Termux), so workspaces intentionally omitted from the install cannot force
+    a reinstall on every launch. Direct dependency checks still catch a
+    partially pruned root tree such as a missing ``agent-browser``.
     """
     # Prebuilt self-contained bundle (nix / packaged release): no lockfile
     # shipped, dist/entry.js is the single runtime artefact.
@@ -1695,46 +1805,21 @@ def _tui_need_npm_install(root: Path) -> bool:
     lock = ws_root / "package-lock.json"
     if entry.is_file() and not lock.is_file():
         return False
-
-    ink = ws_root / "node_modules" / "@hermes" / "ink" / "package.json"
-    if not ink.is_file():
+    if include_workspace_root is None:
+        include_workspace_root = not _is_termux_startup_environment()
+    if not _tui_dependency_tree_ready(
+        root, include_workspace_root=include_workspace_root
+    ):
         return True
-    if not lock.is_file():
-        return False
-    marker = ws_root / "node_modules" / ".package-lock.json"
-    if not marker.is_file():
-        return True
-
-    # Compare lockfile contents, not mtimes: git checkouts and npm rewrites
-    # can bump the root lockfile timestamp even when installed deps already
-    # match. Fall back to mtime when either file is unparseable.
+    wanted = _tui_install_fingerprint(
+        root, include_workspace_root=include_workspace_root
+    )
+    marker = ws_root / "node_modules" / _TUI_INSTALL_FINGERPRINT
     try:
-        wanted = json.loads(lock.read_text(encoding="utf-8")).get("packages") or {}
-        installed = json.loads(marker.read_text(encoding="utf-8")).get("packages") or {}
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return lock.stat().st_mtime > marker.stat().st_mtime
-
-    def comparable(pkg: dict) -> dict:
-        return {k: v for k, v in pkg.items() if k not in _NPM_LOCK_RUNTIME_KEYS}
-
-    for name, pkg in wanted.items():
-        if not name:
-            continue
-
-        if not isinstance(pkg, dict):
-            continue
-
-        if name not in installed:
-            if pkg.get("optional") or pkg.get("peer"):
-                continue
-            return True
-
-        if isinstance(installed[name], dict) and comparable(pkg) != comparable(
-            installed[name]
-        ):
-            return True
-
-    return False
+        installed = marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return True
+    return wanted is None or installed != wanted
 
 
 _TUI_BUILD_INPUT_DIRS = (
@@ -2023,7 +2108,11 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
         # _workspace_root() returns tui_dir itself.  Passing --workspace in
         # that case fails because npm cannot find a workspace named "ui-tui"
         # inside ui-tui/.  See #42973.
-        npm_workspace_args: tuple[str, ...] = () if npm_cwd == tui_dir else ("--workspace", "ui-tui")
+        npm_workspace_args: tuple[str, ...] = (
+            ()
+            if npm_cwd == tui_dir
+            else ("--workspace", "ui-tui", "--include-workspace-root")
+        )
         if termux_startup:
             npm_cwd, npm_workspace_args = _termux_workspace_install_context(
                 tui_dir,
@@ -2032,6 +2121,7 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
         npm_install_cmd = [
             npm,
             "install",
+            "--no-save",
             *npm_workspace_args,
             # --include=dev: ui-tui's build toolchain (esbuild, typescript)
             # lives in devDependencies. An inherited NODE_ENV=production
@@ -2082,6 +2172,11 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             print("npm install failed.")
             if preview:
                 print(preview)
+            sys.exit(1)
+        if not _record_tui_install_fingerprint(
+            tui_dir, include_workspace_root=not termux_startup
+        ):
+            print("npm install completed but the TUI dependency tree is incomplete.")
             sys.exit(1)
         did_install = True
 

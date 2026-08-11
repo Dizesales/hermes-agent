@@ -2150,7 +2150,13 @@ def _update_node_dependencies() -> list[str]:
 
     # Step 2: install only the workspaces update needs (ui-tui, web).
     # --workspace selects specific workspaces; the rest (desktop) are skipped.
+    # npm prunes root dependencies during a scoped `ci` unless the root is
+    # explicitly retained, undoing step 1 (including agent-browser). Termux
+    # keeps its existing workspace-only policy.
+    include_workspace_root = not _m()._is_termux_env()
     ws_args = [*extra_args, "--workspace", "ui-tui", "--workspace", "web"]
+    if include_workspace_root:
+        ws_args.append("--include-workspace-root")
     ws_result = _m()._run_npm_install_deterministic(
         npm,
         _m().PROJECT_ROOT,
@@ -2159,6 +2165,13 @@ def _update_node_dependencies() -> list[str]:
         env=nixos_env,
     )
     if ws_result.returncode == 0:
+        tui_ready = _m()._record_tui_install_fingerprint(
+            _m().PROJECT_ROOT / "ui-tui",
+            include_workspace_root=include_workspace_root,
+        )
+        if not tui_ready:
+            print("  ⚠ npm reported success but dependencies remain incomplete")
+            return _partial_update_failure("repo root", "ui-tui workspaces")
         _record_npm_lockfile_hash(shared_hermes_root)
         print("  ✓ repo root + ui-tui, web workspaces (desktop skipped)")
         return []

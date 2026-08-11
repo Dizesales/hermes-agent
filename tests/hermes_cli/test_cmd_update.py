@@ -712,6 +712,68 @@ class TestNodeRuntimeNpmResolution:
         out = capsys.readouterr().out
         assert "mixed state" in out
 
+    def test_node_refresh_keeps_root_in_workspace_install(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import main as hm
+
+        (tmp_path / "package.json").write_text("{}")
+        (tmp_path / "package-lock.json").write_text("{}")
+        (tmp_path / "ui-tui").mkdir()
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(hm, "_resolve_node_runtime_npm", lambda: "/usr/bin/npm")
+        monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda _root: True)
+        monkeypatch.setattr(hm, "_nixos_build_env", lambda: None)
+        monkeypatch.setattr(hm, "_is_termux_env", lambda: False)
+        monkeypatch.setattr(
+            "hermes_constants.get_default_hermes_root",
+            lambda: tmp_path / "hermes-home",
+        )
+        monkeypatch.setattr(
+            hm, "_record_tui_install_fingerprint", lambda *a, **k: True
+        )
+        calls = []
+
+        def successful_install(*args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+        monkeypatch.setattr(hm, "_run_npm_install_deterministic", successful_install)
+
+        assert hm._update_node_dependencies() == []
+        assert len(calls) == 2
+        workspace_args = calls[1][1]["extra_args"]
+        assert "--workspace" in workspace_args
+        assert "ui-tui" in workspace_args
+        assert "web" in workspace_args
+        assert "--include-workspace-root" in workspace_args
+
+    def test_node_refresh_rejects_incomplete_success(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import main as hm
+
+        (tmp_path / "package.json").write_text("{}")
+        (tmp_path / "package-lock.json").write_text("{}")
+        (tmp_path / "ui-tui").mkdir()
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(hm, "_resolve_node_runtime_npm", lambda: "/usr/bin/npm")
+        monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda _root: True)
+        monkeypatch.setattr(hm, "_nixos_build_env", lambda: None)
+        monkeypatch.setattr(hm, "_is_termux_env", lambda: False)
+        monkeypatch.setattr(
+            hm, "_record_tui_install_fingerprint", lambda *a, **k: False
+        )
+        monkeypatch.setattr(
+            hm,
+            "_run_npm_install_deterministic",
+            lambda *a, **k: subprocess.CompletedProcess(
+                [], 0, stdout="", stderr=""
+            ),
+        )
+
+        assert hm._update_node_dependencies() == ["repo root", "ui-tui workspaces"]
+
 
 
     def test_wsl_update_skips_windows_npm_build_paths(self, mock_args, monkeypatch):
