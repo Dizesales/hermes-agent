@@ -47,7 +47,7 @@ def clone_honcho_for_profile(profile_name: str) -> bool:
     for key in ("recallMode", "writeFrequency", "sessionStrategy",
                 "sessionPeerPrefix", "contextTokens", "dialecticReasoningLevel",
                 "dialecticDynamic", "dialecticMaxChars", "messageMaxChars",
-                "dialecticMaxInputChars", "saveMessages", "observation",
+                "dialecticMaxInputChars", "readOnly", "saveMessages", "observation",
                 "pinUserPeer", "userPeerAliases", "runtimePeerPrefix"):
         val = default_block.get(key)
         if val is not None:
@@ -88,6 +88,8 @@ def _ensure_peer_exists(host_key: str | None = None) -> bool:
         hcfg = HonchoClientConfig.from_global_config(host=host_key)
         if not hcfg.enabled or not (hcfg.api_key or hcfg.base_url):
             return False
+        if getattr(hcfg, "read_only", False):
+            return False
         client = get_honcho_client(hcfg)
         # peer() is idempotent -- creates if missing, returns if exists
         client.peer(hcfg.ai_peer)
@@ -117,7 +119,7 @@ def cmd_enable(args) -> None:
         for key in ("recallMode", "writeFrequency", "sessionStrategy",
                     "contextTokens", "dialecticReasoningLevel", "dialecticDynamic",
                     "dialecticMaxChars", "messageMaxChars", "dialecticMaxInputChars",
-                    "saveMessages", "observation"):
+                    "readOnly", "saveMessages", "observation"):
             val = default_block.get(key)
             if val is not None and key not in block:
                 block[key] = val
@@ -1031,6 +1033,8 @@ def cmd_setup(args) -> None:
     print(f"  User:      {hcfg.peer_name}")
     print(f"  AI peer:   {hcfg.ai_peer}")
     print(f"  Observe:   {hcfg.observation_mode}")
+    read_only = bool(getattr(hcfg, "read_only", False))
+    print(f"  Read-only: {'on' if read_only else 'off'}")
     print(f"  Frequency: {hcfg.write_frequency}")
     print(f"  Recall:    {hcfg.recall_mode}")
     print(f"  Sessions:  {hcfg.session_strategy}")
@@ -1038,8 +1042,9 @@ def cmd_setup(args) -> None:
     print("    honcho_context   -- session context: summary, representation, card, messages")
     print("    honcho_search    -- semantic search over history")
     print("    honcho_profile   -- peer card, key facts")
-    print("    honcho_reasoning -- ask Honcho a question, synthesized answer")
-    print("    honcho_conclude  -- persist a user fact to memory")
+    if not read_only:
+        print("    honcho_reasoning -- ask Honcho a question, synthesized answer")
+        print("    honcho_conclude  -- persist a user fact to memory")
     print("\n  Other commands:")
     print("    hermes honcho status     -- show full config")
     print("    hermes honcho mode       -- change recall/observation mode")
@@ -1203,6 +1208,10 @@ def cmd_status(args) -> None:
     print(f"  Session key:    {hcfg.resolve_session_name()}")
     print(f"  Session strat:  {hcfg.session_strategy}")
     print(f"  Recall mode:    {hcfg.recall_mode}")
+    print(
+        f"  Read-only:      "
+        f"{'on' if getattr(hcfg, 'read_only', False) else 'off'}"
+    )
     print(f"  Context budget: {hcfg.context_tokens or '(uncapped)'} tokens")
     raw = getattr(hcfg, "raw", None) or {}
     dialectic_cadence = getattr(hcfg, "dialectic_cadence", None) or raw.get("dialecticCadence") or 1
@@ -1229,13 +1238,16 @@ def cmd_status(args) -> None:
 def _show_peer_cards(hcfg, client) -> None:
     """Fetch and display peer cards for the active profile.
 
-    Uses get_or_create to ensure the session exists with peers configured.
-    This is idempotent -- if the session already exists on the server it's
-    just retrieved, not duplicated.
+    Normal mode uses idempotent get-or-create setup. Read-only mode constructs
+    local handles and only queries resources that already exist.
     """
     try:
         from plugins.memory.honcho.session import HonchoSessionManager
-        mgr = HonchoSessionManager(honcho=client, config=hcfg)
+        mgr = HonchoSessionManager(
+            honcho=client,
+            config=hcfg,
+            read_only=bool(getattr(hcfg, "read_only", False)),
+        )
         session_key = hcfg.resolve_session_name()
         mgr.get_or_create(session_key)
 
@@ -1536,7 +1548,11 @@ def cmd_identity(args) -> None:
         from plugins.memory.honcho.session import HonchoSessionManager
         hcfg = HonchoClientConfig.from_global_config(host=_host_key())
         client = get_honcho_client(hcfg)
-        mgr = HonchoSessionManager(honcho=client, config=hcfg)
+        mgr = HonchoSessionManager(
+            honcho=client,
+            config=hcfg,
+            read_only=bool(getattr(hcfg, "read_only", False)),
+        )
         session_key = hcfg.resolve_session_name()
         mgr.get_or_create(session_key)
     except Exception as e:
@@ -1713,7 +1729,11 @@ def cmd_migrate(args) -> None:
                     reset_honcho_client()
                     hcfg = HonchoClientConfig.from_global_config()
                     client = get_honcho_client(hcfg)
-                    mgr = HonchoSessionManager(honcho=client, config=hcfg)
+                    mgr = HonchoSessionManager(
+                        honcho=client,
+                        config=hcfg,
+                        read_only=bool(getattr(hcfg, "read_only", False)),
+                    )
                     session_key = hcfg.resolve_session_name()
                     mgr.get_or_create(session_key)
                     # Upload from each directory that had user files
@@ -1763,7 +1783,11 @@ def cmd_migrate(args) -> None:
                     reset_honcho_client()
                     hcfg = HonchoClientConfig.from_global_config()
                     client = get_honcho_client(hcfg)
-                    mgr = HonchoSessionManager(honcho=client, config=hcfg)
+                    mgr = HonchoSessionManager(
+                        honcho=client,
+                        config=hcfg,
+                        read_only=bool(getattr(hcfg, "read_only", False)),
+                    )
                     session_key = hcfg.resolve_session_name()
                     mgr.get_or_create(session_key)
                     for f in agent_files:

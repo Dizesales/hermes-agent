@@ -254,6 +254,43 @@ CONCLUDE_SCHEMA = {
 
 ALL_TOOL_SCHEMAS = [PROFILE_SCHEMA, SEARCH_SCHEMA, REASONING_SCHEMA, CONTEXT_SCHEMA, CONCLUDE_SCHEMA]
 
+READ_ONLY_PROFILE_SCHEMA = {
+    "name": "honcho_profile",
+    "description": (
+        "Retrieve a peer card from Honcho — a curated list of stored facts "
+        "about that peer. This lookup cannot update the card."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "peer": PROFILE_SCHEMA["parameters"]["properties"]["peer"],
+        },
+        "required": [],
+    },
+}
+READ_ONLY_SEARCH_SCHEMA = {
+    **SEARCH_SCHEMA,
+    "description": (
+        "Search stored Honcho message history across sessions and return ranked "
+        "raw excerpts. This is a lookup-only call and performs no LLM synthesis."
+    ),
+}
+READ_ONLY_CONTEXT_SCHEMA = {
+    **CONTEXT_SCHEMA,
+    "description": (
+        "Retrieve Honcho's stored session snapshot: summary, representation, "
+        "peer card, and recent messages. This is a lookup-only call."
+    ),
+}
+READ_ONLY_TOOL_SCHEMAS = [
+    READ_ONLY_PROFILE_SCHEMA,
+    READ_ONLY_SEARCH_SCHEMA,
+    READ_ONLY_CONTEXT_SCHEMA,
+]
+READ_ONLY_TOOL_NAMES = frozenset(
+    schema["name"] for schema in READ_ONLY_TOOL_SCHEMAS
+)
+
 
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
@@ -323,6 +360,9 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # Cron and flush contexts disable the plugin entirely.
         self._cron_skipped = False
+        # Explicit operator guard: lookup tools only, with no remote resource
+        # creation, ingestion, migration, dialectic, or lifecycle writes.
+        self._read_only = False
 
     @property
     def name(self) -> str:
@@ -333,9 +373,22 @@ class HonchoMemoryProvider(MemoryProvider):
         try:
             from plugins.memory.honcho.client import HonchoClientConfig
             cfg = HonchoClientConfig.from_global_config()
+            # MemoryManager indexes tool schemas before initialize(). Hydrate
+            # the safety mode here so forbidden tools never enter its router.
+            self._apply_config_mode(cfg)
             return cfg.enabled and bool(cfg.api_key or cfg.base_url)
         except Exception:
             return False
+
+    def _apply_config_mode(self, cfg) -> None:
+        """Bind config fields that affect the pre-initialize tool surface."""
+        self._config = cfg
+        # Safety modes are monotonic for a provider instance.  ``is_available``
+        # hydrates this flag before MemoryManager indexes tool schemas; a later
+        # config read must never widen that already-published tool surface.
+        # Disabling the guard therefore requires a fresh provider instance.
+        self._read_only = self._read_only or bool(getattr(cfg, "read_only", False))
+        self._recall_mode = "tools" if self._read_only else cfg.recall_mode
 
     def save_config(self, values, hermes_home):
         """Write config to $HERMES_HOME/honcho.json (Honcho SDK native format)."""
@@ -388,15 +441,13 @@ class HonchoMemoryProvider(MemoryProvider):
                 logger.debug("Honcho not configured — plugin inactive")
                 return
 
-            self._config = cfg
-
-            self._recall_mode = cfg.recall_mode  # "context", "tools", or "hybrid"
+            self._apply_config_mode(cfg)
             logger.debug("Honcho recall_mode: %s", self._recall_mode)
 
             self._injection_frequency = cfg.injection_frequency
             self._context_cadence = cfg.context_cadence
             self._dialectic_cadence = cfg.dialectic_cadence
-            self._query_rewrite_enabled = cfg.query_rewrite
+            self._query_rewrite_enabled = False if self._read_only else cfg.query_rewrite
             self._FIRST_TURN_BASE_TIMEOUT = cfg.first_turn_base_wait
             self._FIRST_TURN_DIALECTIC_CAP = cfg.first_turn_dialectic_wait
             self._dialectic_depth = max(1, min(cfg.dialectic_depth, 3))
@@ -411,6 +462,13 @@ class HonchoMemoryProvider(MemoryProvider):
             self._lazy_init_kwargs = dict(kwargs)
             self._lazy_init_session_id = session_id
             self._session_key = self._resolve_session_key(cfg, session_id, **kwargs)
+
+            if self._read_only:
+                # Only local SDK handles are constructed. This makes lookups
+                # immediately available without creating peers/sessions or
+                # running migration and prewarm paths.
+                self._ensure_session()
+                return
 
             # Network-backed session creation can block on Honcho service or DB
             # outages. Startup must fail open for context/hybrid modes, where
@@ -512,10 +570,16 @@ class HonchoMemoryProvider(MemoryProvider):
             context_tokens=cfg.context_tokens,
             runtime_user_peer_name=kwargs.get("user_id") or None,
             runtime_user_peer_name_alt=kwargs.get("user_id_alt") or None,
+            read_only=self._read_only,
         )
 
         self._session_key = self._resolve_session_key(cfg, session_id, **kwargs)
         logger.debug("Honcho session key resolved: %s", self._session_key)
+
+        if self._read_only:
+            self._manager.open_read_only(self._session_key)
+            self._session_initialized = True
+            return
 
         # Create the remote session before running startup-only migration and
         # prewarm work. Do not mark the provider ready until this method's
@@ -689,6 +753,15 @@ class HonchoMemoryProvider(MemoryProvider):
             if not self._config:
                 return ""
 
+        if self._read_only:
+            return (
+                "# Honcho Memory\n"
+                "Active in read-only mode. Use honcho_profile, honcho_search, "
+                "or honcho_context to look up stored memory. This session cannot "
+                "create resources, ingest content, run dialectic reasoning, or "
+                "write to Honcho."
+            )
+
         if self._recall_mode == "context":
             header = (
                 "# Honcho Memory\n"
@@ -729,7 +802,7 @@ class HonchoMemoryProvider(MemoryProvider):
         Returns empty in tools-only mode and respects the configured injection
         frequency and context budget.
         """
-        if self._cron_skipped:
+        if self._cron_skipped or self._read_only:
             return ""
 
         # Tools-only mode has no automatic injection.
@@ -963,7 +1036,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
         Context and dialectic refreshes have independent cadence controls.
         """
-        if self._cron_skipped:
+        if self._cron_skipped or self._read_only:
             return
         # Tools-only mode has no automatic prefetch.
         if self._recall_mode == "tools":
@@ -1234,7 +1307,7 @@ class HonchoMemoryProvider(MemoryProvider):
         Each pass is conditional — bails early if prior pass returned strong signal.
         Returns the best (usually last) result.
         """
-        if not self._manager or not self._session_key:
+        if self._read_only or not self._manager or not self._session_key:
             return ""
 
         is_cold = not self._base_context_cache
@@ -1362,6 +1435,15 @@ class HonchoMemoryProvider(MemoryProvider):
           3. Self-hosted Honcho backend doesn't support peer cards
              (honcho-ai server < 3.x)
         """
+        if self._read_only:
+            return {
+                "result": "No stored profile facts available.",
+                "hint": (
+                    "Honcho is in read-only mode and cannot build or update this "
+                    "profile. Try honcho_search or honcho_context for existing data."
+                ),
+            }
+
         cfg = self._config
         reasons: List[str] = []
 
@@ -1413,7 +1495,7 @@ class HonchoMemoryProvider(MemoryProvider):
         Honors saveMessages: false — the provider then never persists raw
         turns to Honcho (read/tools paths stay fully functional).
         """
-        if self._cron_skipped:
+        if self._cron_skipped or self._read_only:
             return
         # ``saveMessages`` is the operator's hard write gate. Previously it
         # was parsed into HonchoClientConfig but never enforced here, so a
@@ -1477,7 +1559,7 @@ class HonchoMemoryProvider(MemoryProvider):
         """
         if action != "add" or target != "user" or not content:
             return
-        if self._cron_skipped:
+        if self._cron_skipped or self._read_only:
             return
         # ``saveMessages`` is the operator's hard write gate; the memory-tool
         # mirror is an automatic Honcho mutation path and must respect it too,
@@ -1501,7 +1583,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Flush all pending messages to Honcho on session end."""
-        if self._cron_skipped:
+        if self._cron_skipped or self._read_only:
             return
         if not getattr(self._config, "save_messages", True):
             return
@@ -1524,6 +1606,8 @@ class HonchoMemoryProvider(MemoryProvider):
         """
         if self._cron_skipped:
             return []
+        if self._read_only:
+            return list(READ_ONLY_TOOL_SCHEMAS)
         if self._recall_mode == "context":
             return []
         return list(ALL_TOOL_SCHEMAS)
@@ -1534,6 +1618,17 @@ class HonchoMemoryProvider(MemoryProvider):
 
         if self._cron_skipped:
             return tool_error("Honcho is not active (cron context).")
+
+        args = args or {}
+        if self._read_only:
+            if tool_name not in READ_ONLY_TOOL_NAMES:
+                return tool_error(
+                    "Honcho write and reasoning tools are disabled in read-only mode."
+                )
+            if tool_name == "honcho_profile" and "card" in args:
+                return tool_error(
+                    "Honcho profile updates are disabled in read-only mode."
+                )
 
         if not self._session_initialized:
             if self._init_thread and self._init_thread.is_alive():
@@ -1672,6 +1767,8 @@ class HonchoMemoryProvider(MemoryProvider):
             return tool_error(f"Honcho {tool_name} failed: {e}")
 
     def shutdown(self) -> None:
+        if self._read_only:
+            return
         for t in (self._prefetch_thread, self._sync_thread, getattr(self, "_memwrite_thread", None)):
             if t and t.is_alive():
                 t.join(timeout=5.0)

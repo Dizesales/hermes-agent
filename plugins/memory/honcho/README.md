@@ -34,6 +34,37 @@ echo "HONCHO_API_KEY=***" >> ~/.hermes/.env
 > memory provider — the `honcho` subcommand is registered for the active
 > provider only. On a fresh install, use `hermes memory setup honcho`.
 
+## Read-only Guard
+
+Set `readOnly: true` in the active host block for a lookup-only deployment:
+
+```json
+{
+  "hosts": {
+    "hermes": {
+      "enabled": true,
+      "readOnly": true,
+      "workspace": "hermes",
+      "peerName": "operator",
+      "aiPeer": "hermes"
+    }
+  }
+}
+```
+
+The guard overrides recall to tools-only and exposes exactly
+`honcho_profile`, `honcho_search`, and `honcho_context`. The profile schema has
+no write parameter. The dispatcher and session manager independently reject
+card updates, conclusions, dialectic reasoning, message capture, file/history
+migration, and flushes. SDK peer/session handles are constructed locally, so
+the provider does not call Honcho's workspace, peer, or session get-or-create
+helpers or `add_peers()`.
+
+Resources and stored content must therefore be provisioned before the guard is
+enabled. `readOnly` is a Hermes runtime boundary, not a server-side permission:
+Honcho 3.x tokens are resource-scoped, not verb-scoped, so another process with
+the same credential can still write.
+
 ## Architecture Overview
 
 ### Two-Layer Context Injection
@@ -123,7 +154,8 @@ The auto-injected dialectic scales `dialecticReasoningLevel` by query length: +1
 
 ## Tools
 
-Five bidirectional tools. All accept an optional `peer` parameter (`"user"` or `"ai"`, default `"user"`).
+Five bidirectional tools are available in normal mode. All accept an optional
+`peer` parameter (`"user"` or `"ai"`, default `"user"`).
 
 | Tool | LLM call? | Description |
 |------|-----------|-------------|
@@ -133,7 +165,9 @@ Five bidirectional tools. All accept an optional `peer` parameter (`"user"` or `
 | `honcho_reasoning` | Yes | LLM-synthesized answer via dialectic `.chat()` |
 | `honcho_conclude` | No | Write, list/search, or delete persistent conclusions (list surfaces the ids delete needs) |
 
-Tool visibility depends on `recallMode`: hidden in `context` mode, always present in `tools` and `hybrid`.
+Tool visibility depends on `recallMode`: hidden in `context` mode, always
+present in `tools` and `hybrid`. `readOnly: true` overrides this with the three
+lookup-only tools described above.
 
 ## Config Resolution
 
@@ -207,6 +241,7 @@ Pick **[e]** at the prompt to set the three keys directly instead of going throu
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `recallMode` | string | `"hybrid"` | `"hybrid"` (auto-inject + tools), `"context"` (auto-inject only, tools hidden), `"tools"` (tools only, no injection). Legacy `"auto"` → `"hybrid"` |
+| `readOnly` | bool | `false` | Enforce lookup-only tools, local-only SDK handles, no automatic injection/reasoning, and no content or lifecycle writes. Host-level overrides root. |
 | `observationMode` | string | `"directional"` | Preset: `"directional"` (all on) or `"unified"` (user observes self, AI observes others). Use `observation` object for granular control |
 | `observation` | object | — | Per-peer observation config (see Observation section) |
 

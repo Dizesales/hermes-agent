@@ -130,6 +130,7 @@ class HonchoSessionManager:
         config: Any | None = None,
         runtime_user_peer_name: str | None = None,
         runtime_user_peer_name_alt: str | None = None,
+        read_only: bool = False,
     ):
         """
         Initialize the session manager.
@@ -141,12 +142,15 @@ class HonchoSessionManager:
                     write_frequency, observation, etc.).
             runtime_user_peer_name: Gateway user identity for per-user memory scoping.
             runtime_user_peer_name_alt: Optional stable alternate gateway identity.
+            read_only: Build lookup-only SDK handles and disable every writer.
         """
         self._honcho = honcho
+        self._read_only_source_client: Honcho | None = None
         self._context_tokens = context_tokens
         self._config = config
         self._runtime_user_peer_name = runtime_user_peer_name
         self._runtime_user_peer_name_alt = runtime_user_peer_name_alt
+        self._read_only = read_only
         self._cache: dict[str, HonchoSession] = {}
         self._cache_lock = threading.RLock()
         self._peers_cache: dict[str, Any] = {}
@@ -203,7 +207,7 @@ class HonchoSessionManager:
         self._async_queue: queue.Queue | None = None
         self._async_thread: threading.Thread | None = None
         self._async_thread_lock = threading.Lock()
-        if write_frequency == "async":
+        if write_frequency == "async" and not read_only:
             self._async_queue = queue.Queue()
 
     @property
@@ -218,8 +222,25 @@ class HonchoSessionManager:
         that daemon threads cannot see, migrating every access onto the
         first-built profile's client (#69123, #74065).
         """
-        self._honcho = get_honcho_client(self._config)
+        client = get_honcho_client(self._config)
+        if not self._read_only_enabled():
+            self._honcho = client
+            return self._honcho
+
+        # honcho-ai 2.x's public peer()/session() helpers first issue remote
+        # get-or-create calls. A shallow copy shares the authenticated transport
+        # while isolating the private workspace-ready flag from writable users
+        # of the cached source client.
+        if client is not self._read_only_source_client:
+            self._read_only_source_client = client
+            self._honcho = client.model_copy(deep=False)
+            self._honcho._workspace_ensured = True
+        assert self._honcho is not None
         return self._honcho
+
+    def _read_only_enabled(self) -> bool:
+        """Return the guard state, including legacy/test objects built via __new__."""
+        return bool(getattr(self, "_read_only", False))
 
     def _record_auth_failure(self, exc: BaseException) -> None:
         detail = _redact_tokens(str(exc))
@@ -340,14 +361,19 @@ class HonchoSessionManager:
         return result
 
     def _sdk_session(self, session_id: str) -> Any:
-        """Get or create the SDK session; a client rebuild clears the cache, so re-fetch."""
+        """Resolve an SDK session handle, creating remotely only in write mode."""
         while True:
             with self._cache_lock:
                 cached = self._sessions_cache.get(session_id)
                 generation = self._client_generation
             if cached is not None:
                 return cached
-            sdk_session = self.honcho.session(session_id)
+            if self._read_only_enabled():
+                from honcho import Session
+
+                sdk_session = Session(session_id, self.honcho)
+            else:
+                sdk_session = self.honcho.session(session_id)
             with self._cache_lock:
                 if self._client_generation == generation:
                     return self._sessions_cache.setdefault(session_id, sdk_session)
@@ -355,14 +381,19 @@ class HonchoSessionManager:
             # discarded transport. Don't cache it — resolve afresh.
 
     def _get_or_create_peer(self, peer_id: str) -> Any:
-        """Get or create a Honcho peer (one get-or-create API call, then cached)."""
+        """Resolve a peer handle, creating remotely only in write mode."""
         while True:
             with self._cache_lock:
                 if peer_id in self._peers_cache:
                     return self._peers_cache[peer_id]
                 generation = self._client_generation
 
-            peer = self._authed_call("peer setup", lambda: self.honcho.peer(peer_id))
+            if self._read_only_enabled():
+                from honcho import Peer
+
+                peer = Peer(peer_id, self.honcho)
+            else:
+                peer = self._authed_call("peer setup", lambda: self.honcho.peer(peer_id))
             with self._cache_lock:
                 if self._client_generation == generation:
                     return self._peers_cache.setdefault(peer_id, peer)
@@ -377,6 +408,8 @@ class HonchoSessionManager:
         Returns:
             Tuple of (honcho_session, existing_messages).
         """
+        if self._read_only_enabled():
+            raise RuntimeError("Honcho remote session setup is disabled in read-only mode")
         with self._cache_lock:
             if session_id in self._sessions_cache:
                 logger.debug("Honcho session '%s' retrieved from cache", session_id)
@@ -608,6 +641,9 @@ class HonchoSessionManager:
         Returns:
             The session.
         """
+        if self._read_only_enabled():
+            return self.open_read_only(key)
+
         with self._cache_lock:
             if key in self._cache:
                 logger.debug("Local session cache hit: %s", key)
@@ -657,8 +693,43 @@ class HonchoSessionManager:
             self._cache[key] = session
         return session
 
+    def open_read_only(self, key: str) -> HonchoSession:
+        """Open local lookup handles without mutating remote Honcho resources.
+
+        Direct SDK domain-object construction avoids workspace, peer, and
+        session get-or-create calls, ``add_peers()``, message loading, and
+        memory-file migration. The resource must already exist for reads to
+        return data; a missing resource fails as an empty/error read.
+        """
+        with self._cache_lock:
+            if key in self._cache:
+                return self._cache[key]
+
+        user_peer_id = self._resolve_user_peer_id(key)
+        assistant_peer_id = self._sanitize_id(
+            self._config.ai_peer if self._config else "hermes-assistant"
+        )
+        honcho_session_id = self._sanitize_id(key)
+        session = HonchoSession(
+            key=key,
+            user_peer_id=user_peer_id,
+            assistant_peer_id=assistant_peer_id,
+            honcho_session_id=honcho_session_id,
+        )
+        remote_session = self._sdk_session(honcho_session_id)
+
+        with self._cache_lock:
+            existing = self._cache.get(key)
+            if existing is not None:
+                return existing
+            self._cache[key] = session
+            self._sessions_cache[honcho_session_id] = remote_session
+        return session
+
     def _flush_session(self, session: HonchoSession) -> bool:
         """Internal: write unsynced messages to Honcho synchronously."""
+        if self._read_only_enabled():
+            return False
         if not session.messages:
             return True
 
@@ -746,6 +817,8 @@ class HonchoSessionManager:
           "session" — defer until flush_session() is called explicitly
           N (int)   — flush every N turns
         """
+        if self._read_only_enabled():
+            return
         self._turn_counter += 1
         wf = self._write_frequency
 
@@ -768,6 +841,8 @@ class HonchoSessionManager:
         Called at session end for "session" write_frequency, or to force
         a sync before process exit regardless of mode.
         """
+        if self._read_only_enabled():
+            return
         with self._cache_lock:
             sessions = list(self._cache.values())
         for session in sessions:
@@ -901,6 +976,8 @@ class HonchoSessionManager:
             HonchoAuthError: the backend rejected our credentials and a forced
                 token refresh plus one retry did not recover.
         """
+        if self._read_only_enabled():
+            return ""
         session = self._cache.get(session_key)
         if not session:
             return ""
@@ -1061,6 +1138,8 @@ class HonchoSessionManager:
         Returns:
             True if upload succeeded, False otherwise.
         """
+        if self._read_only_enabled():
+            return False
         session = self._cache.get(session_key)
         if not session:
             logger.warning("No local session cached for '%s', skipping migration", session_key)
@@ -1135,6 +1214,9 @@ class HonchoSessionManager:
         Returns:
             True if at least one file was uploaded, False otherwise.
         """
+        if self._read_only_enabled():
+            return False
+
         from pathlib import Path
         memory_path = Path(memory_dir)
 
@@ -1596,6 +1678,8 @@ class HonchoSessionManager:
         Returns:
             True on success, False on failure.
         """
+        if self._read_only_enabled():
+            return False
         if not content or not content.strip():
             return False
 
@@ -1636,6 +1720,8 @@ class HonchoSessionManager:
         Returns:
             True on success, False on failure.
         """
+        if self._read_only_enabled():
+            return False
         session = self._cache.get(session_key)
         if not session:
             return False
@@ -1704,6 +1790,8 @@ class HonchoSessionManager:
         Returns:
             Updated card on success, None on failure.
         """
+        if self._read_only_enabled():
+            return None
         session = self._cache.get(session_key)
         if not session:
             return None
@@ -1752,6 +1840,8 @@ class HonchoSessionManager:
         if not content or not content.strip():
             return False
 
+        if self._read_only_enabled():
+            return False
         session = self._cache.get(session_key)
         if not session:
             logger.warning("No session cached for '%s', skipping AI seed", session_key)

@@ -49,6 +49,8 @@ def test_declares_the_new_field_kinds():
     assert provider is not None
 
     by_key = {f.key: f for f in provider.fields}
+    assert by_key["readOnly"].kind == KIND_BOOL
+    assert by_key["readOnly"].scope == "host"
     assert by_key["saveMessages"].kind == KIND_BOOL
     assert by_key["dialecticMaxChars"].kind == KIND_NUMBER
     assert by_key["userPeerAliases"].kind == KIND_JSON

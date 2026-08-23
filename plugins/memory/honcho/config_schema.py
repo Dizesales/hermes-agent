@@ -172,6 +172,18 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="Session",
             scope="root",
         ),
+        # — Safety —
+        ProviderField(
+            key="readOnly",
+            label="Read-only guard",
+            kind=KIND_BOOL,
+            default="false",
+            description=(
+                "Expose only lookup tools and disable remote resource setup, "
+                "message capture, migration, dialectic reasoning, and writes."
+            ),
+            group="Safety",
+        ),
         # — Message writing —
         ProviderField(
             key="saveMessages",

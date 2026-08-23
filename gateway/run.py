@@ -26133,10 +26133,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         "honcho.peer_name",
         "honcho.ai_peer",
         "honcho.pin_peer_name",
+        "honcho.read_only",
         "honcho.runtime_peer_prefix",
         "honcho.user_peer_aliases",
     )
-    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None], dict[str, Any]] = {}
+    _HONCHO_CACHE_BUSTING_MEMO: dict[
+        tuple[str, int | None, int | None, int | None], dict[str, Any]
+    ] = {}
 
     @classmethod
     def _empty_honcho_cache_busting_config(cls) -> dict[str, Any]:
@@ -26150,10 +26153,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             path = resolve_config_path()
             try:
-                mtime_ns = path.stat().st_mtime_ns
+                stat = path.stat()
+                mtime_ns = stat.st_mtime_ns
+                ctime_ns = stat.st_ctime_ns
+                size = stat.st_size
             except OSError:
                 mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+                ctime_ns = None
+                size = None
+            memo_key = (str(path), mtime_ns, ctime_ns, size)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)
@@ -26164,6 +26172,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "honcho.peer_name": hcfg.peer_name,
                 "honcho.ai_peer": hcfg.ai_peer,
                 "honcho.pin_peer_name": bool(hcfg.pin_peer_name),
+                "honcho.read_only": bool(getattr(hcfg, "read_only", False)),
                 "honcho.runtime_peer_prefix": hcfg.runtime_peer_prefix or "",
                 "honcho.user_peer_aliases": sorted(aliases.items()) if isinstance(aliases, dict) else [],
             }

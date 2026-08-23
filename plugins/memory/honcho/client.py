@@ -407,6 +407,10 @@ class HonchoClientConfig:
     runtime_peer_prefix: str = ""
     # Toggles
     enabled: bool = False
+    # Content and transport safety boundary. When enabled, the provider exposes
+    # lookup-only tools and constructs SDK resource handles without invoking
+    # Honcho's get-or-create helpers.
+    read_only: bool = False
     save_messages: bool = True
     # Write frequency: "async" (background thread), "turn" (sync per turn),
     # "session" (flush on session end), or int (every N turns)
@@ -554,8 +558,30 @@ class HonchoClientConfig:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as e:
-            logger.warning("Failed to read %s: %s, falling back to env", path, e)
-            return cls.from_env(host=resolved_host)
+            logger.warning("Failed to read %s: %s; disabling Honcho", path, e)
+            return cls(
+                host=resolved_host,
+                ai_peer=resolved_host,
+                enabled=False,
+                read_only=True,
+                explicitly_configured=True,
+                config_path=path,
+                hermes_home=get_hermes_home(),
+            )
+
+        if not isinstance(raw, dict):
+            logger.warning(
+                "Invalid Honcho config object in %s; disabling Honcho", path
+            )
+            return cls(
+                host=resolved_host,
+                ai_peer=resolved_host,
+                enabled=False,
+                read_only=True,
+                explicitly_configured=True,
+                config_path=path,
+                hermes_home=get_hermes_home(),
+            )
 
         host_block = _host_block(raw, resolved_host)
         # A hosts.hermes block or explicit enabled flag means the user
@@ -701,6 +727,11 @@ class HonchoClientConfig:
                 "runtimePeerPrefix",
             ),
             enabled=enabled,
+            read_only=_resolve_bool(
+                host_block.get("readOnly"),
+                raw.get("readOnly"),
+                default=False,
+            ),
             save_messages=save_messages,
             write_frequency=write_frequency,
             context_tokens=_parse_context_tokens(

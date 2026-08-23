@@ -32,6 +32,7 @@ class TestHonchoClientConfigDefaults:
         assert config.environment == "production"
         assert config.timeout is None
         assert config.enabled is False
+        assert config.read_only is False
         assert config.save_messages is True
         assert config.session_strategy == "per-directory"
         assert config.recall_mode == "hybrid"
@@ -193,14 +194,67 @@ class TestFromGlobalConfig:
         config = HonchoClientConfig.from_global_config(config_path=config_file)
         assert config.recall_mode == "context"
 
+    def test_read_only_host_block_overrides_root_false(self, tmp_path):
+        """False is meaningful: host-level readOnly must beat a true root."""
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({
+            "apiKey": "key",
+            "readOnly": True,
+            "hosts": {"hermes": {"readOnly": False}},
+        }))
 
-    def test_corrupt_config_falls_back_to_env(self, tmp_path):
+        config = HonchoClientConfig.from_global_config(config_path=config_file)
+
+        assert config.read_only is False
+
+    def test_read_only_host_block_can_enable_guard(self, tmp_path):
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({
+            "apiKey": "key",
+            "hosts": {"hermes": {"readOnly": True}},
+        }))
+
+        config = HonchoClientConfig.from_global_config(config_path=config_file)
+
+        assert config.read_only is True
+
+
+    def test_corrupt_config_fails_closed_ignoring_env_credentials(self, tmp_path):
         config_file = tmp_path / "config.json"
         config_file.write_text("not valid json{{{")
 
-        config = HonchoClientConfig.from_global_config(config_path=config_file)
-        # Should fall back to from_env without crashing
-        assert isinstance(config, HonchoClientConfig)
+        with patch.dict(
+            os.environ,
+            {
+                "HONCHO_API_KEY": "must-not-leak-through",
+                "HONCHO_BASE_URL": "http://127.0.0.1:8000",
+            },
+            clear=False,
+        ):
+            config = HonchoClientConfig.from_global_config(config_path=config_file)
+
+        assert config.enabled is False
+        assert config.read_only is True
+        assert config.api_key is None
+        assert config.base_url is None
+        assert config.explicitly_configured is True
+        assert config.config_path == config_file
+
+    @pytest.mark.parametrize("payload", ["[]", "null", '"not-an-object"'])
+    def test_non_object_config_fails_closed(self, tmp_path, payload):
+        config_file = tmp_path / "config.json"
+        config_file.write_text(payload)
+
+        with patch.dict(
+            os.environ,
+            {"HONCHO_API_KEY": "must-not-leak-through"},
+            clear=False,
+        ):
+            config = HonchoClientConfig.from_global_config(config_path=config_file)
+
+        assert config.enabled is False
+        assert config.read_only is True
+        assert config.api_key is None
 
     def test_base_url_host_block_overrides_root_and_env(self, tmp_path):
         """Host-specific baseUrl should win for self-hosted Honcho deployments."""
@@ -776,4 +830,3 @@ class TestGetHonchoClientBaseUrlDoublePrefixFix:
         assert passed_base_url == expected, (
             f"Expected {expected!r}, got {passed_base_url!r}"
         )
-
