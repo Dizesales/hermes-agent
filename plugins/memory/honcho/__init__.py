@@ -54,6 +54,34 @@ def _is_internal_gateway_turn(text: str) -> bool:
     return bool(_INTERNAL_GATEWAY_TURN_RE.match(text or ""))
 
 
+# OAuth client IDs are public identifiers, not bearer secrets, but they still
+# identify a live auth client and do not belong in relational-memory output.
+# Keep this Honcho-specific instead of broadening the global secret redactor,
+# where such identifiers can be legitimate diagnostics.
+_GOOGLE_OAUTH_CLIENT_ID_RE = re.compile(
+    r"(?<![\w-])\d{6,}-[A-Za-z0-9_-]{8,}\.apps\.googleusercontent\.com(?![\w.-])",
+    re.IGNORECASE,
+)
+
+
+def _redact_honcho_auth_identifiers(value: Any) -> Any:
+    """Redact auth-client identifiers at the Honcho tool-output boundary."""
+    if isinstance(value, str):
+        return _GOOGLE_OAUTH_CLIENT_ID_RE.sub(
+            "[REDACTED_GOOGLE_OAUTH_CLIENT_ID]", value
+        )
+    if isinstance(value, list):
+        return [_redact_honcho_auth_identifiers(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_honcho_auth_identifiers(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: _redact_honcho_auth_identifiers(item)
+            for key, item in value.items()
+        }
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas (moved from tools/honcho_tools.py)
 # ---------------------------------------------------------------------------
@@ -1636,7 +1664,8 @@ class HonchoMemoryProvider(MemoryProvider):
             if not self._ensure_session():
                 if self._init_auth_failure:
                     return tool_error(
-                        f"Honcho memory authentication failed: {self._init_auth_failure}"
+                        "Honcho memory authentication failed: "
+                        f"{_redact_honcho_auth_identifiers(self._init_auth_failure)}"
                     )
                 return tool_error("Honcho session could not be initialized.")
 
@@ -1655,7 +1684,9 @@ class HonchoMemoryProvider(MemoryProvider):
                 card = self._manager.get_peer_card(self._session_key, peer=peer)
                 if not card:
                     return json.dumps(self._empty_profile_hint(peer))
-                return json.dumps({"result": card})
+                return json.dumps(
+                    {"result": _redact_honcho_auth_identifiers(card)}
+                )
 
             elif tool_name == "honcho_search":
                 query = (args.get("query") or "").strip()
@@ -1668,7 +1699,9 @@ class HonchoMemoryProvider(MemoryProvider):
                 )
                 if not result:
                     return json.dumps({"result": "No relevant context found."})
-                return json.dumps({"result": result})
+                return json.dumps(
+                    {"result": _redact_honcho_auth_identifiers(result)}
+                )
 
             elif tool_name == "honcho_reasoning":
                 query = (args.get("query") or "").strip()
@@ -1692,9 +1725,10 @@ class HonchoMemoryProvider(MemoryProvider):
                     # Let the outer dispatch's auth-specific handler render this.
                     raise
                 except Exception as e:
-                    logger.warning("honcho_reasoning failed: %s", e)
+                    safe_error = _redact_honcho_auth_identifiers(str(e))
+                    logger.warning("honcho_reasoning failed: %s", safe_error)
                     return tool_error(
-                        f"Honcho reasoning query failed ({e}). This is a backend "
+                        f"Honcho reasoning query failed ({safe_error}). This is a backend "
                         "error, not an empty result — the peer may still have "
                         "relevant context. Slow dialectic calls at higher "
                         "reasoning levels can exceed the configured timeout; "
@@ -1703,7 +1737,13 @@ class HonchoMemoryProvider(MemoryProvider):
                     )
                 # Update cadence tracker so auto-injection respects the gap after an explicit call
                 self._last_dialectic_turn = self._turn_count
-                return json.dumps({"result": result or "No result from Honcho."})
+                return json.dumps(
+                    {
+                        "result": _redact_honcho_auth_identifiers(
+                            result or "No result from Honcho."
+                        )
+                    }
+                )
 
             elif tool_name == "honcho_context":
                 peer = args.get("peer", "user")
@@ -1724,7 +1764,13 @@ class HonchoMemoryProvider(MemoryProvider):
                         for m in msgs[-5:]  # last 5 for brevity
                     )
                     parts.append(f"## Recent messages\n{msg_str}")
-                return json.dumps({"result": "\n\n".join(parts) or "No context available."})
+                return json.dumps(
+                    {
+                        "result": _redact_honcho_auth_identifiers(
+                            "\n\n".join(parts) or "No context available."
+                        )
+                    }
+                )
 
             elif tool_name == "honcho_conclude":
                 delete_id = (args.get("delete_id") or "").strip()
@@ -1745,7 +1791,13 @@ class HonchoMemoryProvider(MemoryProvider):
                     conclusions = self._manager.list_conclusions(
                         self._session_key, query=query or None, peer=peer
                     )
-                    return json.dumps({"conclusions": conclusions})
+                    return json.dumps(
+                        {
+                            "conclusions": _redact_honcho_auth_identifiers(
+                                conclusions
+                            )
+                        }
+                    )
                 if has_delete_id:
                     ok = self._manager.delete_conclusion(self._session_key, delete_id, peer=peer)
                     if ok:
@@ -1761,10 +1813,12 @@ class HonchoMemoryProvider(MemoryProvider):
         except HonchoAuthError as e:
             # Never report an auth failure as an empty result; the model would read it as "no memory".
             logger.error("Honcho tool %s failed: authentication rejected", tool_name)
-            return tool_error(f"Honcho memory authentication failed: {e}")
+            safe_error = _redact_honcho_auth_identifiers(str(e))
+            return tool_error(f"Honcho memory authentication failed: {safe_error}")
         except Exception as e:
-            logger.error("Honcho tool %s failed: %s", tool_name, e)
-            return tool_error(f"Honcho {tool_name} failed: {e}")
+            safe_error = _redact_honcho_auth_identifiers(str(e))
+            logger.error("Honcho tool %s failed: %s", tool_name, safe_error)
+            return tool_error(f"Honcho {tool_name} failed: {safe_error}")
 
     def shutdown(self) -> None:
         if self._read_only:

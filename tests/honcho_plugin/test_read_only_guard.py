@@ -8,7 +8,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.memory_manager import MemoryManager
-from plugins.memory.honcho import HonchoMemoryProvider
+from plugins.memory.honcho import (
+    HonchoMemoryProvider,
+    _redact_honcho_auth_identifiers,
+)
 from plugins.memory.honcho.client import HonchoClientConfig
 from plugins.memory.honcho.session import HonchoSessionManager
 
@@ -57,6 +60,26 @@ def _initialized_provider():
 
 
 class TestReadOnlyToolBoundary:
+    def test_auth_identifier_redactor_handles_nested_case_and_near_miss(self):
+        client_id = (
+            "123456789012-abcdefghijklmnopqrstuvwxyz.apps.googleusercontent.com"
+        )
+        nested = {
+            "values": [
+                f"({client_id}) and {client_id.upper()}",
+                "service.apps.googleusercontent.com",
+                "123-short.apps.googleusercontent.com",
+            ]
+        }
+
+        result = _redact_honcho_auth_identifiers(nested)
+
+        assert client_id not in result["values"][0].lower()
+        assert result["values"][0].count(
+            "[REDACTED_GOOGLE_OAUTH_CLIENT_ID]"
+        ) == 2
+        assert result["values"][1:] == nested["values"][1:]
+
     def test_is_available_hydrates_router_before_initialize(self):
         provider = HonchoMemoryProvider()
         with patch(
@@ -131,6 +154,51 @@ class TestReadOnlyToolBoundary:
         assert profile["result"] == ["stored fact"]
         assert search["result"] == "stored excerpt"
         assert "stored summary" in context["result"]
+
+    def test_lookup_tools_redact_google_oauth_client_ids(self):
+        provider = HonchoMemoryProvider()
+        provider._apply_config_mode(_config())
+        provider._manager = MagicMock()
+        provider._session_initialized = True
+        provider._session_key = "readonly-test"
+        client_id = (
+            "123456789012-abcdefghijklmnopqrstuvwxyz.apps.googleusercontent.com"
+        )
+        provider._manager.get_peer_card.return_value = [f"client {client_id}"]
+        provider._manager.search_context.return_value = f"found {client_id}"
+        provider._manager.get_session_context.return_value = {
+            "summary": f"summary {client_id}",
+            "representation": f"representation {client_id}",
+            "recent_messages": [{"role": "user", "content": client_id}],
+        }
+
+        profile = provider.handle_tool_call("honcho_profile", {})
+        search = provider.handle_tool_call(
+            "honcho_search", {"query": "oauth client"}
+        )
+        context = provider.handle_tool_call("honcho_context", {})
+
+        for result in (profile, search, context):
+            assert client_id not in result
+            assert "[REDACTED_GOOGLE_OAUTH_CLIENT_ID]" in result
+
+    def test_lookup_tool_errors_redact_google_oauth_client_ids(self):
+        provider = HonchoMemoryProvider()
+        provider._apply_config_mode(_config())
+        provider._manager = MagicMock()
+        provider._session_initialized = True
+        provider._session_key = "readonly-test"
+        client_id = (
+            "123456789012-abcdefghijklmnopqrstuvwxyz.apps.googleusercontent.com"
+        )
+        provider._manager.search_context.side_effect = RuntimeError(client_id)
+
+        result = provider.handle_tool_call(
+            "honcho_search", {"query": "oauth client"}
+        )
+
+        assert client_id not in result
+        assert "[REDACTED_GOOGLE_OAUTH_CLIENT_ID]" in result
 
     def test_gateway_cache_signature_changes_with_guard(self, tmp_path, monkeypatch):
         from gateway.run import GatewayRunner
