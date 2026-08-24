@@ -1621,8 +1621,14 @@ class HonchoSessionManager:
             raise
         except Exception as e:
             logger.debug("Honcho message search failed (peer_perspective=%s): %s", peer_id, e)
-            # Fall back to peer-authored search if the perspective filter is
-            # unsupported by the running Honcho version.
+            messages = []
+
+        # Historical imports can predate the session membership's joined_at,
+        # so a valid perspective search may return no rows even though the
+        # peer's own authored history is searchable.  Use the existing
+        # peer-scoped, read-only fallback for both unsupported filters and
+        # empty perspective results.
+        if not messages:
             try:
                 messages = self._authed_call(
                     "peer search",

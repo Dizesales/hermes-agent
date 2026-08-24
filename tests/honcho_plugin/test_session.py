@@ -181,6 +181,34 @@ class TestPeerLookupHelpers:
         # user-stated facts from assistant-derived ones.
         assert "[assistant" in result
 
+    def test_search_context_falls_back_to_peer_history_when_perspective_is_empty(self):
+        """Historical imports remain searchable when joined_at is newer than messages."""
+        mgr, session = self._make_cached_manager()
+        honcho_client = MagicMock()
+        honcho_client.search.return_value = []
+        peer = MagicMock()
+        peer.search.return_value = [
+            SimpleNamespace(
+                content="I founded neuralancer in 2019",
+                peer_id="robert",
+                session_id="s-imported",
+                id="m1",
+            ),
+        ]
+        mgr._get_or_create_peer = MagicMock(return_value=peer)
+
+        with patch.object(
+            HonchoSessionManager,
+            "honcho",
+            new_callable=lambda: property(lambda s: honcho_client),
+        ):
+            result = mgr.search_context(session.key, "neuralancer")
+
+        honcho_client.search.assert_called_once()
+        mgr._get_or_create_peer.assert_called_once_with(session.user_peer_id)
+        peer.search.assert_called_once()
+        assert "neuralancer in 2019" in result
+
 
     def test_create_conclusion_defaults_to_user_target(self):
         mgr, session = self._make_cached_manager()
@@ -1314,4 +1342,3 @@ class TestGetSessionContextFallback:
         peer_id, target = fetch_calls[0]
         assert peer_id == "user-peer"
         assert target == "user-peer"
-
