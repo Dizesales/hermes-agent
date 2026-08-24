@@ -567,6 +567,12 @@ class HonchoSessionManager:
                 if isinstance(alias, str) and alias.strip():
                     explicit_ids.add(self._sanitize_id(alias.strip()))
 
+        session_aliases = getattr(self._config, "session_peer_aliases", {})
+        if isinstance(session_aliases, dict):
+            for alias in session_aliases.values():
+                if isinstance(alias, str) and alias.strip():
+                    explicit_ids.add(self._sanitize_id(alias.strip()))
+
         return explicit_ids
 
     def _generated_runtime_peer_id(self, prefix: str, runtime_id: str) -> str:
@@ -608,6 +614,20 @@ class HonchoSessionManager:
         )
         if pin_peer_name:
             return self._sanitize_id(self._config.peer_name)
+
+        # Shared group/thread sessions can contain several runtime users.  An
+        # explicit session mapping therefore takes precedence over per-user
+        # aliases: it prevents whichever participant happened to trigger this
+        # turn from being treated as the owner of the group's durable memory.
+        session_aliases = (
+            getattr(self._config, "session_peer_aliases", {})
+            if self._config
+            else {}
+        )
+        if isinstance(session_aliases, dict):
+            session_alias = session_aliases.get(key)
+            if isinstance(session_alias, str) and session_alias.strip():
+                return self._sanitize_id(session_alias.strip())
 
         runtime_ids = self._runtime_user_ids()
         if runtime_ids:

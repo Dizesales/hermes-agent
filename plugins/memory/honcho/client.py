@@ -403,6 +403,11 @@ class HonchoClientConfig:
     # config replaces the root map as a whole so profiles can intentionally
     # own their identity mappings.
     user_peer_aliases: dict[str, str] = field(default_factory=dict)
+    # Map resolved gateway session keys to stable Honcho peers.  This is the
+    # safe identity boundary for shared group/thread sessions where one
+    # session can contain messages from several runtime users and therefore a
+    # single user ID cannot truthfully own the conversation.
+    session_peer_aliases: dict[str, str] = field(default_factory=dict)
     # Optional prefix for unknown gateway runtime user IDs, e.g. "telegram_".
     runtime_peer_prefix: str = ""
     # Toggles
@@ -720,6 +725,11 @@ class HonchoClientConfig:
                 host_block,
                 raw,
                 "userPeerAliases",
+            ),
+            session_peer_aliases=_parse_string_map(
+                host_block,
+                raw,
+                "sessionPeerAliases",
             ),
             runtime_peer_prefix=_parse_optional_string(
                 host_block,

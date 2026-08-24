@@ -80,6 +80,7 @@ class TestRuntimePeerMappingConfigParsing:
     def test_defaults_are_empty(self):
         config = HonchoClientConfig()
         assert config.user_peer_aliases == {}
+        assert config.session_peer_aliases == {}
         assert config.runtime_peer_prefix == ""
 
 
@@ -93,6 +94,32 @@ class TestRuntimePeerMappingConfigParsing:
         config = HonchoClientConfig.from_global_config(config_path=config_file)
 
         assert config.user_peer_aliases == {}
+
+    def test_session_peer_aliases_parse_as_exact_map(self, tmp_path):
+        config_file = tmp_path / "honcho.json"
+        config_file.write_text(json.dumps({
+            "apiKey": "k",
+            "sessionPeerAliases": {
+                "agent-main-telegram-group-123-topic": "group-a1b2c3",
+            },
+        }))
+
+        config = HonchoClientConfig.from_global_config(config_path=config_file)
+
+        assert config.session_peer_aliases == {
+            "agent-main-telegram-group-123-topic": "group-a1b2c3",
+        }
+
+    def test_malformed_session_alias_config_is_ignored(self, tmp_path):
+        config_file = tmp_path / "honcho.json"
+        config_file.write_text(json.dumps({
+            "apiKey": "k",
+            "sessionPeerAliases": ["not", "a", "map"],
+        }))
+
+        config = HonchoClientConfig.from_global_config(config_path=config_file)
+
+        assert config.session_peer_aliases == {}
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +148,7 @@ class TestPeerResolutionOrder:
         peer_name: str | None,
         pin_peer_name: bool,
         user_peer_aliases: dict[str, str] | None = None,
+        session_peer_aliases: dict[str, str] | None = None,
         runtime_peer_prefix: str = "",
         session_peer_prefix: bool = False,
     ) -> HonchoClientConfig:
@@ -131,6 +159,7 @@ class TestPeerResolutionOrder:
             peer_name=peer_name,
             pin_peer_name=pin_peer_name,
             user_peer_aliases=user_peer_aliases or {},
+            session_peer_aliases=session_peer_aliases or {},
             runtime_peer_prefix=runtime_peer_prefix,
             session_peer_prefix=session_peer_prefix,
             enabled=False,
@@ -171,6 +200,44 @@ class TestPeerResolutionOrder:
 
         session = mgr.get_or_create("telegram:7654321")
         assert session.user_peer_id == "Igor"
+
+    def test_session_alias_wins_for_shared_group_over_runtime_user(self):
+        """A shared topic belongs to its group peer, not the latest sender."""
+        key = "agent-main-telegram-group-123-topic"
+        mgr = HonchoSessionManager(
+            honcho=MagicMock(),
+            config=self._config(
+                peer_name=None,
+                pin_peer_name=False,
+                user_peer_aliases={"7654321": "person-lucas"},
+                session_peer_aliases={key: "group-a1b2c3"},
+            ),
+            runtime_user_peer_name="7654321",
+        )
+        _patch_manager_for_resolution_test(mgr)
+
+        session = mgr.get_or_create(key)
+
+        assert session.user_peer_id == "group-a1b2c3"
+
+    def test_session_alias_is_exact_and_does_not_bleed_to_sibling_group(self):
+        """Nearby keys retain per-user isolation unless explicitly mapped."""
+        mapped_key = "agent-main-telegram-group-123-topic"
+        mgr = HonchoSessionManager(
+            honcho=MagicMock(),
+            config=self._config(
+                peer_name=None,
+                pin_peer_name=False,
+                user_peer_aliases={"7654321": "person-lucas"},
+                session_peer_aliases={mapped_key: "group-a1b2c3"},
+            ),
+            runtime_user_peer_name="7654321",
+        )
+        _patch_manager_for_resolution_test(mgr)
+
+        session = mgr.get_or_create(f"{mapped_key}-sibling")
+
+        assert session.user_peer_id == "person-lucas"
 
     def test_unknown_runtime_id_uses_prefix(self):
         """Unknown gateway users stay isolated but become platform-scoped."""
@@ -529,6 +596,36 @@ class TestPinTransition:
 
         assert sig_pinned["honcho.pin_peer_name"] != sig_unpinned["honcho.pin_peer_name"]
 
+    def test_cache_busting_signature_reflects_session_peer_aliases(self, tmp_path, monkeypatch):
+        """A routing-map edit must rebuild the cached manager next turn."""
+        from gateway.run import GatewayRunner
+
+        cfg_path = tmp_path / "honcho.json"
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        cfg_path.write_text(json.dumps({
+            "apiKey": "k",
+            "sessionPeerAliases": {"group-one": "peer-one"},
+        }))
+        sig_one = GatewayRunner._extract_cache_busting_config(
+            {"memory": {"provider": "honcho"}}
+        )
+
+        cfg_path.write_text(json.dumps({
+            "apiKey": "k",
+            # Different length makes this independent of filesystem timestamp
+            # granularity while still exercising the real memo invalidation.
+            "sessionPeerAliases": {"group-one": "peer-two-longer"},
+        }))
+        sig_two = GatewayRunner._extract_cache_busting_config(
+            {"memory": {"provider": "honcho"}}
+        )
+
+        assert (
+            sig_one["honcho.session_peer_aliases"]
+            != sig_two["honcho.session_peer_aliases"]
+        )
+
 
 class TestProfilePeerUniqueness:
     """Each Hermes profile can pin to its own unique peerName.
@@ -571,4 +668,3 @@ class TestProfilePeerUniqueness:
             "Profiles pinned to distinct peer names must not collapse to "
             "the same Honcho peer — otherwise profile isolation is fictional."
         )
-
