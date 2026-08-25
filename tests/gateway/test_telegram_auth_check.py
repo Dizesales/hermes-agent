@@ -144,6 +144,45 @@ def test_is_user_authorized_from_message_allow_from():
     assert adapter._is_user_authorized_from_message(msg) is False
 
 
+def test_group_static_allowlist_miss_can_be_authorized_by_runner_pairing():
+    """A legacy group allowlist must not override a dynamic pairing grant."""
+
+    class Runner:
+        def _is_user_authorized(self, source):
+            return source.chat_type == "group" and source.user_id == "333"
+
+        async def handle(self, _event):
+            return None
+
+    adapter = _make_adapter(group_allow_from=["111", "222"])
+    adapter._message_handler = Runner().handle
+
+    assert adapter._is_user_authorized_from_message(
+        _make_message(from_user_id=333, chat_id=-100, chat_type="group")
+    ) is True
+
+
+def test_group_dynamic_pairing_revocation_applies_without_static_config_change():
+    """Exercise the real runner + PairingStore union and revocation path."""
+    from gateway.pairing import PairingStore
+    from gateway.run import GatewayRunner
+
+    store = PairingStore()
+    store._approve_user("telegram", "333", "Portal-managed user")
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner.pairing_store = store
+    runner.pairing_stores = {}
+
+    adapter = _make_adapter(group_allow_from=["111", "222"])
+    adapter._message_handler = runner._is_user_authorized
+    message = _make_message(from_user_id=333, chat_id=-100, chat_type="group")
+
+    assert adapter._is_user_authorized_from_message(message) is True
+    assert store.revoke("telegram", "333") is True
+    assert adapter._is_user_authorized_from_message(message) is False
+
+
 def test_allowlist_dm_with_explicit_pair_behavior_reaches_gateway(monkeypatch):
     """Allowlist + unauthorized_dm_behavior:pair must not early-drop unknown DMs.
 

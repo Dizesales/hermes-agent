@@ -1437,16 +1437,21 @@ class TelegramAdapter(BasePlatformAdapter):
             if "*" not in dm_allowed_users and user_id not in dm_allowed_users:
                 return False
 
-        # Adapter-level allow_from / group_allow_from: when set, they are the
-        # sole authority.  Group chats use group_allow_from; DMs use allow_from.
+        # Adapter-level allow_from / group_allow_from entries are one
+        # authorization source, not a ceiling. PairingStore approvals are a
+        # first-class union in the runner and must remain effective even when
+        # legacy static allowlists are still configured. Group chats use
+        # group_allow_from; DMs use allow_from.
         chat_type = source.chat_type or ""
         if chat_type in ("group", "forum", "channel"):
             adapter_allow_from = self.config.extra.get("group_allow_from")
         else:
             adapter_allow_from = self.config.extra.get("allow_from")
+        adapter_allowlist_configured = adapter_allow_from is not None
         if adapter_allow_from is not None:
             allowed = _coerce_allow_set(adapter_allow_from)
-            authorized = user_id in allowed or "*" in allowed
+            if user_id in allowed or "*" in allowed:
+                authorized = True
 
         # Test/custom injection only. The class method named
         # _is_callback_user_authorized is for inline button callbacks and must
@@ -1485,7 +1490,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Only make an early decision when an allowlist actually exists;
                 # otherwise unknown DMs must reach the pairing flow rather than
                 # being default-denied here.
-                if not self._telegram_auth_env_configured():
+                if (
+                    not self._telegram_auth_env_configured()
+                    and not adapter_allowlist_configured
+                ):
                     return True
                 decision = (
                     self._is_sender_authorized(
@@ -1511,9 +1519,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if authorized is None:
             allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
             if not allowed_csv:
-                return True
-            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-            authorized = "*" in allowed_ids or user_id in allowed_ids
+                if not adapter_allowlist_configured:
+                    return True
+                authorized = False
+            else:
+                allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+                authorized = "*" in allowed_ids or user_id in allowed_ids
 
         if authorized:
             return True
