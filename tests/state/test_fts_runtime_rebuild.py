@@ -100,6 +100,30 @@ class TestRuntimeFtsRebuild:
             sqlite3.DatabaseError("no such table: nothing_fts_related")
         )
 
+    def test_canonical_damage_refuses_live_fts_rebuild(self, db, monkeypatch):
+        """A generic malformed error is not sufficient authority to rebuild.
+
+        The canonical-table gate is the boundary that prevents a damaged
+        sessions/routing B-tree from being mistaken for derived FTS damage.
+        """
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        rebuilt = []
+        monkeypatch.setattr(
+            db,
+            "_canonical_storage_allows_live_fts_repair",
+            lambda: False,
+        )
+        monkeypatch.setattr(db, "rebuild_fts", lambda: rebuilt.append(True))
+
+        result = db._try_runtime_fts_rebuild(
+            sqlite3.DatabaseError("database disk image is malformed")
+        )
+
+        assert result is False
+        assert rebuilt == []
+        assert db._fts_runtime_rebuild_attempted is False
+
     def test_append_self_heals_after_fts_corruption(self, db, tmp_path):
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")
@@ -362,4 +386,3 @@ class TestRuntimeFtsRebuild:
             assert recovered.search_messages("canonical survives")
         finally:
             recovered.close()
-

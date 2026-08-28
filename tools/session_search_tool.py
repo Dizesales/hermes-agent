@@ -1085,7 +1085,11 @@ def session_search(
         try:
             from hermes_state import SessionDB
 
-            db = SessionDB()
+            # session_search is semantically read-only.  A writable SessionDB
+            # performs schema reconciliation and requests a WAL checkpoint on
+            # close; transient searches must never become independent writers
+            # or checkpointers against the live gateway store.
+            db = SessionDB(read_only=True)
             owned_dbs.append(db)
         except Exception:
             logging.debug("SessionDB unavailable for session_search", exc_info=True)

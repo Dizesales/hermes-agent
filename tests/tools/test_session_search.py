@@ -125,11 +125,18 @@ class TestBrowseShape:
                 self.closed += 1
 
         db = _DB()
-        monkeypatch.setattr("hermes_state.SessionDB", lambda: db)
+        opened = []
+
+        def _open_db(*, read_only=False):
+            opened.append(read_only)
+            return db
+
+        monkeypatch.setattr("hermes_state.SessionDB", _open_db)
 
         result = json.loads(session_search())
 
         assert result["success"] is True
+        assert opened == [True]
         assert db.closed == 1
 
     def test_cross_profile_database_is_closed_but_shared_database_is_not(

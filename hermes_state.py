@@ -3287,6 +3287,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # in place at most once per SessionDB instance so a genuinely
         # unrecoverable database can't put writers into a rebuild loop.
         self._fts_runtime_rebuild_attempted = False
+        # Sticky refusal after a canonical-table health gate fails.  A generic
+        # SQLITE_CORRUPT message can come from either an FTS shadow table or a
+        # canonical B-tree.  Once canonical damage is observed, no live FTS
+        # rebuild/detach path may mutate this connection again.
+        self._fts_repair_refused_for_canonical_damage = False
         # One-shot guard for the runtime connection-reopen recovery on the
         # write path. A connection whose backing file was replaced/truncated
         # by a sibling process surfaces as "file is not a database" on every
@@ -4196,19 +4201,56 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     @staticmethod
     def _is_fts_write_corruption_error(exc: sqlite3.DatabaseError) -> bool:
-        """True for the error class a corrupt FTS index raises on writes.
+        """True when *exc* is a candidate FTS-corruption error.
 
         The message varies by SQLite version: older builds raise the generic
         ``database disk image is malformed`` (covered by
         ``is_malformed_db_error``); newer builds (e.g. ubuntu-latest CI)
         raise the FTS5-specific ``fts5: corrupt structure record for table
-        "messages_fts"``. Both mean the same thing for the write path: the
-        canonical rows are fine, the FTS shadow tables are not.
+        "messages_fts"``.  The generic form is only a candidate: callers must
+        additionally prove that canonical tables are healthy before treating
+        it as derived-index damage.
         """
         if is_malformed_db_error(exc):
             return True
         msg = str(exc).lower()
         return "fts5" in msg and "corrupt" in msg
+
+    def _canonical_storage_allows_live_fts_repair(self) -> bool:
+        """Return True only when core canonical B-trees pass targeted checks.
+
+        Runtime FTS recovery is intentionally additive: it may rebuild or
+        detach derived indexes only after ``sessions``, ``messages`` and
+        ``gateway_routing`` have each passed SQLite's table-scoped quick
+        check.  A generic ``database disk image is malformed`` from one of
+        those structures must fail closed for offline recovery instead of
+        being misclassified as FTS and amplified into large live WAL writes.
+        """
+        if self._fts_repair_refused_for_canonical_damage:
+            return False
+        try:
+            with self._lock:
+                for table_name in ("sessions", "messages", "gateway_routing"):
+                    rows = self._conn.execute(
+                        f"PRAGMA quick_check('{table_name}')"
+                    ).fetchall()
+                    if not rows or any(
+                        not row or str(row[0]).strip().lower() != "ok"
+                        for row in rows
+                    ):
+                        raise sqlite3.DatabaseError(
+                            f"quick_check({table_name}) returned {rows[:3]!r}"
+                        )
+        except sqlite3.Error as gate_exc:
+            self._fts_repair_refused_for_canonical_damage = True
+            logger.error(
+                "state.db canonical-table health gate failed (%s); refusing "
+                "live FTS rebuild/detach. Preserve DB/WAL/SHM and recover "
+                "offline.",
+                gate_exc,
+            )
+            return False
+        return True
 
     def _try_runtime_fts_rebuild(self, exc: sqlite3.DatabaseError) -> bool:
         """One-shot in-place FTS rebuild after a corrupt-index write failure.
@@ -4231,6 +4273,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not self._fts_enabled:
             return False
         if not self._is_fts_write_corruption_error(exc):
+            return False
+        if not self._canonical_storage_allows_live_fts_repair():
             return False
         self._fts_runtime_rebuild_attempted = True
         logger.warning(
@@ -4268,6 +4312,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         never reinstall the triggers without first rebuilding every row.
         """
         if not self._fts_enabled or not self._is_fts_write_corruption_error(exc):
+            return False
+        if not self._canonical_storage_allows_live_fts_repair():
             return False
 
         try:
