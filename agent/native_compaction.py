@@ -147,11 +147,64 @@ def native_compaction_context_management(
         return None
 
     compressor = getattr(agent, "context_compressor", None)
+    configured_threshold = getattr(
+        agent, "codex_responses_compact_threshold", DEFAULT_COMPACT_THRESHOLD
+    )
+    # One-turn idle override: build_turn_context arms this only when a resumed
+    # request crossed the operator's explicit idle floor. Keep it armed for
+    # the whole turn (tool follow-ups and retries included), then the next turn
+    # prologue clears it. ``min`` preserves a lower static native threshold.
+    idle_threshold = getattr(
+        agent, "_codex_responses_idle_compact_threshold_for_turn", None
+    )
+    try:
+        if idle_threshold is not None and not isinstance(idle_threshold, bool):
+            idle_threshold = int(idle_threshold)
+            if idle_threshold > 0:
+                configured_threshold = min(int(configured_threshold), idle_threshold)
+    except (TypeError, ValueError):
+        pass
+
     threshold = resolve_compact_threshold(
-        getattr(agent, "codex_responses_compact_threshold", DEFAULT_COMPACT_THRESHOLD),
+        configured_threshold,
         getattr(compressor, "threshold_tokens", None) if compressor is not None else None,
     )
     return [{"type": "compaction", "compact_threshold": threshold}]
+
+
+def native_compaction_eligible_for_agent(agent: Any) -> bool:
+    """Return whether this agent can safely use Responses native compaction.
+
+    This is the turn-prologue counterpart of
+    :func:`native_compaction_context_management`. It derives the endpoint
+    flags from the live agent so the idle path can prefer a server-side
+    checkpoint over Hermes' lossy local summary without duplicating a looser
+    eligibility policy.
+    """
+    if getattr(agent, "api_mode", None) != "codex_responses":
+        return False
+    provider = str(getattr(agent, "provider", "") or "").lower()
+    base_url = str(getattr(agent, "base_url", "") or "")
+    try:
+        parsed = urlsplit(base_url)
+        hostname = (parsed.hostname or "").lower()
+        path = (parsed.path or "").lower()
+    except ValueError:
+        hostname = ""
+        path = ""
+    is_codex_backend = provider == "openai-codex" or (
+        hostname == "chatgpt.com" and "/backend-api/codex" in path
+    )
+    is_xai_responses = provider in {"xai", "xai-oauth"} or hostname == "api.x.ai"
+    is_github_responses = (
+        hostname == "models.github.ai" or hostname.endswith("githubcopilot.com")
+    )
+    return native_compaction_context_management(
+        agent,
+        is_codex_backend=is_codex_backend,
+        is_xai_responses=is_xai_responses,
+        is_github_responses=is_github_responses,
+    ) is not None
 
 
 # Retention budget for plaintext user messages carried across a native

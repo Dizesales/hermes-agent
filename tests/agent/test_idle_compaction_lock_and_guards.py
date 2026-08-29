@@ -38,6 +38,7 @@ def _prep_idle_agent(db: SessionDB, session_id: str, *, idle_after: int = 60,
     agent = _build_agent_with_db(db, session_id)
     agent.compression_enabled = True
     agent.compression_idle_compact_after_seconds = idle_after
+    agent.compression_idle_compact_floor_tokens = None
     agent._last_activity_ts = time.time() - idle_gap
     # The idle block reads these from the compressor; give the MagicMock real
     # numbers so the floor computation and the preflight gate behave.
@@ -53,7 +54,9 @@ def _prep_idle_agent(db: SessionDB, session_id: str, *, idle_after: int = 60,
     return agent
 
 
-def _run_prologue(agent, history, user_message="hello again"):
+def _run_prologue(
+    agent, history, user_message="hello again", *, estimated_tokens=999_999
+):
     """Invoke ``build_turn_context`` the way ``conversation_loop`` does.
 
     The token-threshold preflight gate is pinned False so these tests
@@ -64,7 +67,7 @@ def _run_prologue(agent, history, user_message="hello again"):
          patch("agent.turn_context._should_run_preflight_estimate",
                return_value=False), \
          patch("agent.turn_context.estimate_request_tokens_rough",
-               return_value=999_999):
+               return_value=estimated_tokens):
         return build_turn_context(
             agent=agent,
             user_message=user_message,
@@ -110,6 +113,40 @@ def test_idle_compaction_status_emitted_by_default(tmp_path: Path) -> None:
     assert any(
         ev == "lifecycle" and "Resumed after" in str(msg) for ev, msg in events
     ), f"expected idle status line, got: {events}"
+
+
+def test_idle_compaction_respects_explicit_token_floor(tmp_path: Path) -> None:
+    """One hour elapsed is eligibility, not permission to compact 90K."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "IDLE_BELOW_FLOOR"
+    db.create_session(sid, source="cli")
+    agent = _prep_idle_agent(db, sid, idle_after=3600, idle_gap=7200)
+    agent.compression_idle_compact_floor_tokens = 300_000
+
+    _run_prologue(agent, _history(), estimated_tokens=299_999)
+
+    agent.context_compressor.compress.assert_not_called()
+
+
+def test_idle_compaction_arms_native_checkpoint_instead_of_local_summary(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "IDLE_NATIVE"
+    db.create_session(sid, source="cli")
+    agent = _prep_idle_agent(db, sid, idle_after=3600, idle_gap=7200)
+    agent.compression_idle_compact_floor_tokens = 300_000
+    agent.api_mode = "codex_responses"
+    agent.provider = "openai-api"
+    agent.base_url = "https://api.openai.com/v1"
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.codex_responses_compact_threshold = 420_000
+
+    _run_prologue(agent, _history())
+
+    agent.context_compressor.compress.assert_not_called()
+    assert agent._codex_responses_idle_compact_threshold_for_turn == 300_000
 
 
 def test_idle_compaction_defers_to_held_compression_lock(tmp_path: Path) -> None:
@@ -177,13 +214,19 @@ def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> None:
     compressor._ineffective_compression_count = 2  # breaker tripped
     compressor.compress = MagicMock()
     agent.context_compressor = compressor
+    # Make the transport eligible for native compaction too: the shared
+    # anti-thrash gate must block both the local summarizer and the native
+    # one-turn override.
+    agent.api_mode = "codex_responses"
+    agent.provider = "openai-api"
+    agent.base_url = "https://api.openai.com/v1"
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.codex_responses_compact_threshold = 80_000
 
     ctx = _run_prologue(agent, _history())
 
     compressor.compress.assert_not_called()
+    assert agent._codex_responses_idle_compact_threshold_for_turn is None
     assert agent.session_id == sid
     assert len(ctx.messages) == len(_history()) + 1
-
-
-
-

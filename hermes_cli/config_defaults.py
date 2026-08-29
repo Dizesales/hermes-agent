@@ -933,6 +933,15 @@ DEFAULT_CONFIG = {
                                       # failure-cooldown / anti-thrash / per-session
                                       # lock guards as every automatic compaction.
                                       # Example: 1800 = compact after 30 min idle.
+        "idle_compact_floor_tokens": None,  # Optional absolute token floor for
+                                      # the idle trigger. Inactivity only makes a
+                                      # session eligible; compaction still waits
+                                      # until the request is above this floor.
+                                      # None preserves the historical adaptive
+                                      # floor (threshold × target_ratio). Use an
+                                      # explicit value such as 300000 when long
+                                      # raw-context retention is more important
+                                      # than compacting every resumed thread.
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).

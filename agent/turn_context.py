@@ -399,6 +399,46 @@ def _should_idle_compact(
     return tokens > floor_tokens
 
 
+def _idle_gap_since_durable_activity(agent: Any, now: float) -> float:
+    """Return the best conservative between-turn idle gap for ``agent``.
+
+    Gateway cached agents reset ``_last_activity_ts`` at the start of each
+    external turn because that clock also feeds the in-flight stall watchdog.
+    Reading only that in-memory clock therefore makes idle compaction a no-op
+    on the main gateway surface. SessionDB's ``last_activity_at`` is the
+    durable between-turn clock and survives cache eviction/restart. If it is
+    absent or unreadable, fall back to the in-memory value; failure biases to
+    zero idle time, never to an eager compaction.
+    """
+    durable_ts = None
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if session_db is not None and session_id:
+        try:
+            row = session_db.get_session(session_id)
+            raw = row.get("last_activity_at") if isinstance(row, dict) else None
+            if raw is not None and not isinstance(raw, bool):
+                durable_ts = float(raw)
+        except (AttributeError, OSError, TypeError, ValueError):
+            durable_ts = None
+        except Exception:
+            logger.debug(
+                "Idle compaction: durable activity lookup failed for session=%s",
+                session_id,
+                exc_info=True,
+            )
+
+    previous_ts = durable_ts
+    if previous_ts is None:
+        try:
+            previous_ts = float(getattr(agent, "_last_activity_ts", now))
+        except (TypeError, ValueError):
+            previous_ts = now
+    if previous_ts <= 0 or previous_ts > now:
+        return 0.0
+    return max(0.0, now - previous_ts)
+
+
 @dataclass
 class TurnContext:
     """Values produced by the turn prologue and consumed by the turn loop."""
@@ -784,13 +824,16 @@ def build_turn_context(
     # history up front so the rest of the conversation does not keep re-reading
     # a large stale context on every turn. This fires on elapsed wall-clock time
     # rather than size, so it complements (does not replace) the token-threshold
-    # preflight below. ``_last_activity_ts`` is the last time this turn loop did
-    # work; nothing has touched it yet this turn, so it measures the gap since
-    # the previous turn finished. The cheap gap pre-check gates the (more
-    # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
+    # preflight below. SessionDB's durable activity clock measures the gap even
+    # when the gateway reset its in-flight watchdog clock at turn start. The
+    # cheap gap pre-check gates the (more expensive) token estimate, mirroring
+    # ``_should_run_preflight_estimate``.
+    # Per-turn native override must never leak into a later active turn.
+    agent._codex_responses_idle_compact_threshold_for_turn = None
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
     if agent.compression_enabled and _idle_after > 0 and messages:
-        _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
+        _idle_now = time.time()
+        _idle_gap = _idle_gap_since_durable_activity(agent, _idle_now)
         if _idle_gap >= _idle_after:
             _compressor = agent.context_compressor
             _idle_tokens = estimate_request_tokens_rough(
@@ -800,19 +843,35 @@ def build_turn_context(
             )
             # Post-compression target size: don't summarise a thread already
             # below what compaction would reduce it to.
-            _idle_floor = int(
-                _compressor.threshold_tokens * _compressor.summary_target_ratio
+            _configured_idle_floor = getattr(
+                agent, "compression_idle_compact_floor_tokens", None
+            )
+            _idle_floor = (
+                int(_configured_idle_floor)
+                if isinstance(_configured_idle_floor, int)
+                and not isinstance(_configured_idle_floor, bool)
+                and _configured_idle_floor > 0
+                else int(
+                    _compressor.threshold_tokens * _compressor.summary_target_ratio
+                )
             )
             _idle_cooldown = getattr(
                 _compressor, "get_active_compression_failure_cooldown", lambda: None
             )()
+            _idle_guard_active = bool(_idle_cooldown)
+            if not _idle_guard_active:
+                _automatic_blocked = getattr(
+                    type(_compressor), "_automatic_compression_blocked", None
+                )
+                if callable(_automatic_blocked):
+                    _idle_guard_active = bool(_automatic_blocked(_compressor))
             if _should_idle_compact(
                 enabled=agent.compression_enabled,
                 idle_after_seconds=_idle_after,
                 idle_gap_seconds=_idle_gap,
                 tokens=_idle_tokens,
                 floor_tokens=_idle_floor,
-                cooldown_active=bool(_idle_cooldown),
+                cooldown_active=_idle_guard_active,
             ):
                 logger.info(
                     "Idle compaction: %ss idle >= %ss, ~%s tokens > %s floor "
@@ -835,18 +894,38 @@ def build_turn_context(
                 )
                 if _idle_status:
                     agent._emit_status(_idle_status)
-                _idle_input = messages
-                messages, active_system_prompt = agent._compress_context(
-                    messages, system_message, approx_tokens=_idle_tokens,
-                    task_id=effective_task_id,
-                )
+                # On eligible OpenAI Responses routes, ask the provider to
+                # mint its native compaction checkpoint on this turn. This
+                # preserves the model's opaque long-horizon state and keeps
+                # Hermes' full raw transcript in state.db/session_search. If
+                # native compaction is unavailable, fall through to the local
+                # guarded summarizer exactly as before.
+                from agent.native_compaction import native_compaction_eligible_for_agent
+
+                if native_compaction_eligible_for_agent(agent):
+                    agent._codex_responses_idle_compact_threshold_for_turn = (
+                        _idle_floor
+                    )
+                    logger.info(
+                        "Idle compaction: armed native Responses checkpoint at %s "
+                        "tokens for this turn (session %s)",
+                        f"{_idle_floor:,}",
+                        agent.session_id or "none",
+                    )
+                    _idle_input = None
+                else:
+                    _idle_input = messages
+                    messages, active_system_prompt = agent._compress_context(
+                        messages, system_message, approx_tokens=_idle_tokens,
+                        task_id=effective_task_id,
+                    )
                 # ``_compress_context`` returns the INPUT list object when it
                 # skips (per-session lock held by another path, failure
                 # cooldown, anti-thrash breaker, codex-native routing). Only
                 # re-baseline + re-anchor after a real compaction — a skip
                 # must leave the turn's flush baseline and user-message index
                 # untouched.
-                if messages is not _idle_input:
+                if _idle_input is not None and messages is not _idle_input:
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )

@@ -16,6 +16,7 @@ from agent.native_compaction import (
     is_native_compaction_model,
     is_native_compaction_rejection,
     native_compaction_context_management,
+    native_compaction_eligible_for_agent,
     resolve_compact_threshold,
 )
 
@@ -31,6 +32,8 @@ def _agent(
     return SimpleNamespace(
         model=model,
         base_url=base_url,
+        api_mode="codex_responses",
+        provider="openai-api",
         codex_responses_native_compaction=enabled,
         compression_enabled=compression_enabled,
         codex_responses_compact_threshold=threshold,
@@ -144,6 +147,36 @@ class TestRequestGate:
             _agent(compressor=compressor), is_codex_backend=False
         )
         assert payload[0]["compact_threshold"] < 100_000
+
+    def test_idle_override_lowers_threshold_for_one_turn(self):
+        agent = _agent(threshold=420_000)
+        agent._codex_responses_idle_compact_threshold_for_turn = 300_000
+        payload = native_compaction_context_management(
+            agent, is_codex_backend=False
+        )
+        assert payload == [{"type": "compaction", "compact_threshold": 300_000}]
+
+    def test_idle_override_never_raises_lower_static_threshold(self):
+        agent = _agent(threshold=200_000)
+        agent._codex_responses_idle_compact_threshold_for_turn = 300_000
+        payload = native_compaction_context_management(
+            agent, is_codex_backend=False
+        )
+        assert payload == [{"type": "compaction", "compact_threshold": 200_000}]
+
+
+class TestAgentEligibility:
+    def test_direct_responses_agent_is_eligible(self):
+        assert native_compaction_eligible_for_agent(_agent()) is True
+
+    def test_non_responses_agent_is_not_eligible(self):
+        agent = _agent()
+        agent.api_mode = "chat_completions"
+        assert native_compaction_eligible_for_agent(agent) is False
+
+    def test_third_party_responses_agent_is_not_eligible(self):
+        agent = _agent(base_url="https://openrouter.ai/api/v1")
+        assert native_compaction_eligible_for_agent(agent) is False
 
 
 class TestThresholdClamp:

@@ -2304,9 +2304,37 @@ def init_agent(
     # Opt-in idle compaction: compact a session up front when it resumes after
     # this many seconds of inactivity (0 = disabled). Time-based, so it
     # complements the size-based threshold above. Consumed by build_turn_context().
-    compression_idle_compact_after_seconds = max(
-        0, int(_compression_cfg.get("idle_compact_after_seconds", 0))
-    )
+    try:
+        _idle_after_raw = _compression_cfg.get("idle_compact_after_seconds", 0)
+        if isinstance(_idle_after_raw, bool):
+            raise ValueError
+        compression_idle_compact_after_seconds = max(0, int(_idle_after_raw))
+    except (TypeError, ValueError):
+        _ra().logger.warning(
+            "Invalid compression.idle_compact_after_seconds=%r; disabling idle compaction.",
+            _compression_cfg.get("idle_compact_after_seconds"),
+        )
+        compression_idle_compact_after_seconds = 0
+
+    # Optional absolute size floor for the idle trigger. ``None`` keeps the
+    # historical adaptive floor (threshold × target_ratio); a positive value
+    # lets operators make elapsed time an eligibility signal rather than a
+    # command to summarize a still-useful medium-sized context.
+    _idle_floor_raw = _compression_cfg.get("idle_compact_floor_tokens")
+    compression_idle_compact_floor_tokens = None
+    if _idle_floor_raw is not None:
+        try:
+            if isinstance(_idle_floor_raw, bool):
+                raise ValueError
+            compression_idle_compact_floor_tokens = int(_idle_floor_raw)
+            if compression_idle_compact_floor_tokens <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            _ra().logger.warning(
+                "Invalid compression.idle_compact_floor_tokens=%r; using the adaptive floor.",
+                _idle_floor_raw,
+            )
+            compression_idle_compact_floor_tokens = None
 
     # Read optional explicit context_length override for the auxiliary
     # compression model. Custom endpoints often cannot report this via
@@ -2767,6 +2795,9 @@ def init_agent(
     agent.max_compression_attempts = compression_max_attempts
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds
+    )
+    agent.compression_idle_compact_floor_tokens = (
+        compression_idle_compact_floor_tokens
     )
 
     # Reject models whose context window is below the minimum required

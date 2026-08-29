@@ -640,6 +640,13 @@ compression:
   # summarization on a short idle thread. Example: 1800 = compact after 30 min idle.
   idle_compact_after_seconds: 0
 
+  # Optional absolute size floor for the idle trigger. Time alone never
+  # compacts a session at or below this request-token estimate. Leave null to
+  # use the historical adaptive floor (threshold × target_ratio); set an
+  # explicit conservative floor when you want more raw context retained.
+  # Example: 300000 pairs well with a 1-hour idle policy on large windows.
+  idle_compact_floor_tokens: null
+
   # Proactive tool-result prune (default: 0 = disabled). Opt-in token trigger
   # for a deterministic, no-LLM prune of OLD tool-result payloads, run
   # independently of `threshold` above. On large-window models (512K/1M) the
