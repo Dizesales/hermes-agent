@@ -1,0 +1,40 @@
+manifest_version: 2
+api_version: 1
+name: dize-gbrain-librarian
+version: "1.0.0"
+description: "Profile-scoped GBrain librarian: bounded semantic recall before substantive turns, mandatory durable-capture review, and content-free capture telemetry."
+author: Dizevolv
+kind: standalone
+provides_hooks:
+  - pre_llm_call
+  - post_llm_call
+license: Proprietary
+tags:
+  - memory
+  - gbrain
+  - dizevolv
+config_schema:
+  enabled:
+    type: boolean
+    default: true
+  budget_tokens:
+    type: integer
+    default: 900
+  max_results:
+    type: integer
+    default: 3
+  timeout_seconds:
+    type: number
+    default: 4
+  min_query_chars:
+    type: integer
+    default: 12
+  max_query_chars:
+    type: integer
+    default: 3000
+  max_context_chars:
+    type: integer
+    default: 6000
+  capture_review:
+    type: boolean
+    default: true
