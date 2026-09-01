@@ -80,6 +80,7 @@ def test_recall_and_capture_review_are_injected_without_persisting_content(monke
     assert "mcp__gbrain__remember" in result["context"]
     assert ctx.calls[0][0:2] == ("gbrain", "recall")
     assert ctx.calls[0][2]["budget_tokens"] == 900
+    assert ctx.calls[0][3] == 5.0
     serialized_state = json.dumps(ctx.state.values)
     assert "Qual é" not in serialized_state
     assert "session-secret" not in serialized_state

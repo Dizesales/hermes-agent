@@ -253,7 +253,7 @@ def _on_pre_llm_call(
     budget = _bounded_int(ctx, "budget_tokens", 900, 128, 4000)
     max_results = _bounded_int(ctx, "max_results", 3, 1, 8)
     max_context = _bounded_int(ctx, "max_context_chars", 6000, 1000, 20000)
-    timeout = _bounded_float(ctx, "timeout_seconds", 4.0, 1.0, 15.0)
+    timeout = _bounded_float(ctx, "timeout_seconds", 5.0, 1.0, 15.0)
     capture = ctx.get_config("capture_review", True) is not False
 
     started = time.monotonic()

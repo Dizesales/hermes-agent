@@ -61,6 +61,20 @@ def _repos(tmp_path: Path):
     return source, brain, policy
 
 
+def _commit_source(source: Path, text: str, message: str = "sectioned source") -> None:
+    (source / "context" / "decisions.md").write_text(text, encoding="utf-8")
+    _git(source, "add", ".")
+    _git(source, "commit", "-qm", message)
+
+
+def _enable_sections(policy: Path) -> None:
+    data = json.loads(policy.read_text(encoding="utf-8"))
+    data["entries"][0]["sections"] = {
+        "target_dir": "canonical/context/decisions-sections"
+    }
+    policy.write_text(json.dumps(data), encoding="utf-8")
+
+
 def test_projects_git_head_not_dirty_worktree_and_is_idempotent(tmp_path):
     module = _load_projector()
     source, brain, policy = _repos(tmp_path)
@@ -75,6 +89,49 @@ def test_projects_git_head_not_dirty_worktree_and_is_idempotent(tmp_path):
     assert first["entries"][0]["action"] == "updated"
     assert second["changed"] == 0
     assert second["entries"][0]["action"] == "unchanged"
+
+
+def test_projects_one_resolved_commit_when_head_advances_mid_batch(tmp_path, monkeypatch):
+    module = _load_projector()
+    source, brain, policy = _repos(tmp_path)
+    lessons = source / "context" / "lessons.md"
+    lessons.write_text("# Lessons committed\n", encoding="utf-8")
+    _git(source, "add", ".")
+    _git(source, "commit", "-qm", "add lessons")
+    expected_head = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    data = json.loads(policy.read_text(encoding="utf-8"))
+    data["entries"].append(
+        {"source": "context/lessons.md", "target": "canonical/context/lessons.md"}
+    )
+    policy.write_text(json.dumps(data), encoding="utf-8")
+
+    original_run_git = module._run_git
+    advanced = False
+
+    def advancing_run_git(repo, *args):
+        nonlocal advanced
+        result = original_run_git(repo, *args)
+        if args[:2] == ("cat-file", "blob") and not advanced:
+            advanced = True
+            (source / "context" / "decisions.md").write_text(
+                "# Decisions advanced\n", encoding="utf-8"
+            )
+            lessons.write_text("# Lessons advanced\n", encoding="utf-8")
+            _git(source, "add", ".")
+            _git(source, "commit", "-qm", "advance during projection")
+        return result
+
+    monkeypatch.setattr(module, "_run_git", advancing_run_git)
+    receipt = module.project(policy)
+
+    assert receipt["source_head"] == expected_head
+    assert (brain / "canonical/context/decisions.md").read_text() == "# Committed\n"
+    assert (brain / "canonical/context/lessons.md").read_text() == "# Lessons committed\n"
 
 
 @pytest.mark.parametrize(
@@ -118,4 +175,136 @@ def test_rejects_symlinked_target_parent(tmp_path):
     (brain / "canonical").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(module.ProjectionError, match="symlink"):
+        module.project(policy)
+
+
+def test_sectioned_projection_creates_index_and_stable_managed_pages(tmp_path):
+    module = _load_projector()
+    source, brain, policy = _repos(tmp_path)
+    _commit_source(
+        source,
+        "# Decisions\n\nCanonical intro.\n\n"
+        "```markdown\n## Not a projected section\n```\n\n"
+        "## 2026-01-01 — First\n\nAlpha body.\n\n"
+        "## 2026-01-02 — Second\n\nBeta body.\n",
+    )
+    _enable_sections(policy)
+
+    first = module.project(policy)
+    index = brain / "canonical/context/decisions.md"
+    section_dir = brain / "canonical/context/decisions-sections"
+    section_paths = sorted(section_dir.glob("*.md"))
+
+    assert first["changed"] == 3
+    assert len(section_paths) == 2
+    assert "section-index-v1" in index.read_text(encoding="utf-8")
+    assert "Alpha body" not in index.read_text(encoding="utf-8")
+    assert all(
+        "gbrain_library_projection: section-v1"
+        in path.read_text(encoding="utf-8")
+        for path in section_paths
+    )
+    assert any("Alpha body" in path.read_text(encoding="utf-8") for path in section_paths)
+
+    original_names = [path.name for path in section_paths]
+    _commit_source(
+        source,
+        "# Decisions\n\nCanonical intro.\n\n"
+        "```markdown\n## Not a projected section\n```\n\n"
+        "## 2026-01-01 — First\n\nAlpha body updated.\n\n"
+        "## 2026-01-02 — Second\n\nBeta body.\n",
+        "update one section",
+    )
+    second = module.project(policy)
+
+    assert [path.name for path in sorted(section_dir.glob("*.md"))] == original_names
+    assert second["changed"] == 2
+    assert module.project(policy)["changed"] == 0
+
+
+def test_sectioned_projection_deletes_only_its_own_stale_pages(tmp_path):
+    module = _load_projector()
+    source, brain, policy = _repos(tmp_path)
+    _commit_source(
+        source,
+        "# Decisions\n\n## First\n\nAlpha.\n\n## Second\n\nBeta.\n",
+    )
+    _enable_sections(policy)
+    module.project(policy)
+    section_dir = brain / "canonical/context/decisions-sections"
+    previous = set(section_dir.glob("*.md"))
+    unmanaged = section_dir / "operator-note.md"
+    unmanaged.write_text("# Preserve me\n", encoding="utf-8")
+
+    _commit_source(source, "# Decisions\n\n## First\n\nAlpha.\n", "remove section")
+    receipt = module.project(policy)
+
+    remaining_managed = {
+        path
+        for path in section_dir.glob("*.md")
+        if "section-v1" in path.read_text(encoding="utf-8")
+    }
+    assert len(previous - remaining_managed) == 1
+    assert unmanaged.exists()
+    assert [item["action"] for item in receipt["entries"]].count("deleted") == 1
+
+
+def test_sectioned_check_reports_stale_without_mutating(tmp_path):
+    module = _load_projector()
+    source, brain, policy = _repos(tmp_path)
+    _commit_source(
+        source,
+        "# Decisions\n\n## First\n\nAlpha.\n\n## Second\n\nBeta.\n",
+    )
+    _enable_sections(policy)
+    module.project(policy)
+    section_dir = brain / "canonical/context/decisions-sections"
+    before = {path.name: path.read_bytes() for path in section_dir.glob("*.md")}
+    _commit_source(source, "# Decisions\n\n## First\n\nAlpha.\n", "remove section")
+
+    receipt = module.project(policy, check=True)
+
+    assert any(item["action"] == "would_delete" for item in receipt["entries"])
+    assert {path.name: path.read_bytes() for path in section_dir.glob("*.md")} == before
+
+
+def test_stale_section_collision_with_active_target_is_batch_atomic(tmp_path):
+    module = _load_projector()
+    source, brain, policy = _repos(tmp_path)
+    _commit_source(source, "# Decisions\n\n## First\n\nAlpha.\n")
+    _enable_sections(policy)
+    module.project(policy)
+    index = brain / "canonical/context/decisions.md"
+    section_dir = brain / "canonical/context/decisions-sections"
+    old_index = index.read_bytes()
+    stale_path = next(section_dir.glob("*.md"))
+    stale_relative = stale_path.relative_to(brain).as_posix()
+    old_stale = stale_path.read_bytes()
+
+    (source / "context/decisions.md").write_text(
+        "# Decisions\n\n## Second\n\nBeta.\n", encoding="utf-8"
+    )
+    (source / "context/lessons.md").write_text("# Lessons\n", encoding="utf-8")
+    _git(source, "add", ".")
+    _git(source, "commit", "-qm", "replace section and add target")
+    data = json.loads(policy.read_text(encoding="utf-8"))
+    data["entries"].append(
+        {"source": "context/lessons.md", "target": stale_relative}
+    )
+    policy.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(module.ProjectionError, match="conflicts with active target"):
+        module.project(policy)
+
+    assert index.read_bytes() == old_index
+    assert stale_path.read_bytes() == old_stale
+    assert len(list(section_dir.glob("*.md"))) == 1
+
+
+def test_sectioned_projection_rejects_source_without_h2(tmp_path):
+    module = _load_projector()
+    _, _, policy = _repos(tmp_path)
+    _enable_sections(policy)
+
+    with pytest.raises(module.ProjectionError, match="no level-2 headings"):
         module.project(policy)
