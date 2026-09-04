@@ -40,6 +40,7 @@ def _prep_idle_agent(db: SessionDB, session_id: str, *, idle_after: int = 60,
     agent.compression_idle_compact_after_seconds = idle_after
     agent.compression_idle_compact_floor_tokens = None
     agent._last_activity_ts = time.time() - idle_gap
+    agent._test_idle_gap = idle_gap
     # The idle block reads these from the compressor; give the MagicMock real
     # numbers so the floor computation and the preflight gate behave.
     agent.context_compressor.threshold_tokens = 100_000
@@ -64,6 +65,15 @@ def _run_prologue(
     coverage in ``test_turn_context.py``).
     """
     with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None), \
+         patch("agent.turn_context._maybe_title_session_at_turn_start", lambda *a, **k: None), \
+         patch(
+             "agent.turn_context._idle_gap_since_durable_activity",
+             side_effect=lambda agent, _now: agent._test_idle_gap,
+         ), \
+         patch(
+             "agent.turn_context._preflight_request_tokens",
+             return_value=estimated_tokens,
+         ), \
          patch("agent.turn_context._should_run_preflight_estimate",
                return_value=False), \
          patch("agent.turn_context.estimate_request_tokens_rough",
@@ -142,6 +152,7 @@ def test_idle_compaction_arms_native_checkpoint_instead_of_local_summary(
     agent.model = "gpt-5.6"
     agent.codex_responses_native_compaction = True
     agent.codex_responses_compact_threshold = 420_000
+    agent.runtime_capabilities = {"native_compaction": True}
 
     _run_prologue(agent, _history())
 

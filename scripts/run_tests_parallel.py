@@ -382,31 +382,42 @@ def _run_one_file_once(
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
 
-    # Collection can resolve storage paths before fixtures run. Give each
-    # per-file process a private Hermes home and remove it after the attempt.
-    test_home = tempfile.mkdtemp(prefix="hermes-pytest-")
-    child_env = os.environ.copy()
-    child_env["HERMES_HOME"] = test_home
+    # Give this subprocess its own pytest temp root.
+    #
+    # pytest builds its tmp_path root as <temproot>/pytest-of-<user>/. At the
+    # end of a session it walks that directory with cleanup_dead_symlinks().
+    # The walk lists the directory. Then it asks whether the `pytest-current`
+    # symlink resolves. Then it unlinks the symlink.
+    #
+    # Every file shared one root. A second process replaced that symlink
+    # between the question and the unlink. The first process then died with
+    # FileNotFoundError after all of its tests passed.
+    #
+    # The risk grows with the number of processes that finish together. At 8
+    # workers it never occurred. At 144 workers it occurs.
+    #
+    # One root for each subprocess removes the shared directory that the race
+    # needs. The parent deletes the root after the attempt.
+    env = os.environ.copy()
+    temproot = tempfile.mkdtemp(prefix="hermes-pytest-tmproot-")
+    env["PYTEST_DEBUG_TEMPROOT"] = temproot
+    env["HERMES_HOME"] = os.path.join(temproot, "hermes-home")
 
     subproc_start = time.monotonic()
     # launch the pytest process
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=repo_root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace",
-            env=child_env,
-            # POSIX: place the child at the head of its own process group so
-            # _kill_tree can SIGKILL the group atomically.
-            # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-            # _kill_tree handles the Windows path via taskkill /F /T.
-            start_new_session=True,
-        )
-    except BaseException:
-        shutil.rmtree(test_home, ignore_errors=True)
-        raise
+    proc = subprocess.Popen(
+        cmd,
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+        env=env,
+        # POSIX: place the child at the head of its own process group so
+        # _kill_tree can SIGKILL the group atomically.
+        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
+        # _kill_tree handles the Windows path via taskkill /F /T.
+        start_new_session=True,
+    )
 
     # Capture the pgid NOW, before the leader can exit and be reaped. Once
     # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
@@ -437,7 +448,6 @@ def _run_one_file_once(
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
         _kill_tree(proc, pgid=pgid)
-        shutil.rmtree(test_home, ignore_errors=True)
         raise
     else:
         # Happy path: pytest exited on its own. Kill the group anyway in
@@ -445,8 +455,11 @@ def _run_one_file_once(
         _kill_tree(proc, pgid=pgid)
 
         output +=  "\n"
-
-    shutil.rmtree(test_home, ignore_errors=True)
+    finally:
+        # Delete the temp root for this attempt. Nothing reads it after the
+        # subprocess exits. More than 3000 of them fill the disk of the
+        # runner over one suite.
+        shutil.rmtree(temproot, ignore_errors=True)
 
     if rc == 5:
         # No tests collected in THIS file — legitimate per-file: a
