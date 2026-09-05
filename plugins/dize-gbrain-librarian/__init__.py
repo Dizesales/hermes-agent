@@ -148,7 +148,16 @@ def _recall_items(envelope: Any) -> list[Mapping[str, Any]]:
         candidates = []
     if not isinstance(candidates, list):
         return []
-    return [item for item in candidates if isinstance(item, Mapping)]
+    return [item for item in candidates if isinstance(item, Mapping) and _memory_text(item)]
+
+
+def _memory_text(item: Mapping[str, Any]) -> str:
+    """Read passage fields; GBrain's evidence field is a match category."""
+    for key in ("chunk", "text"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
 
 
 def _safe_piece(value: Any, limit: int) -> str:
@@ -174,9 +183,7 @@ def _format_context(
     ]
     for index, item in enumerate(items[:max_results], start=1):
         title = _safe_piece(item.get("title") or item.get("slug"), 180)
-        evidence = _safe_piece(
-            item.get("evidence") or item.get("chunk") or item.get("text"), 1200
-        )
+        evidence = _safe_piece(_memory_text(item), 1200)
         provenance = _safe_piece(item.get("provenance"), 300)
         if not evidence:
             continue

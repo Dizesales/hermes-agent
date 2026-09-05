@@ -61,7 +61,8 @@ def test_recall_and_capture_review_are_injected_without_persisting_content(monke
         "results": [
             {
                 "title": "Canonical decision",
-                "evidence": "Use the owner source before derived surfaces.",
+                "chunk": "Use the owner source before derived surfaces.",
+                "evidence": "keyword_exact",
                 "provenance": {"path": "decisions.md", "line": 10},
             }
         ]
@@ -167,3 +168,57 @@ def test_register_exposes_only_turn_hooks():
     ctx = _Ctx()
     module.register(ctx)
     assert set(ctx.hooks) == {"pre_llm_call", "post_llm_call"}
+
+
+def test_real_recall_categories_never_replace_the_passage(monkeypatch, tmp_path):
+    module = _load_plugin()
+    monkeypatch.setattr(module, "_kill_switch_path", lambda: tmp_path / "disabled")
+    claim = "Reopen the current owner document before changing operating policy."
+    for category in ("keyword_exact", "weak_semantic", "new_match_category"):
+        payload = {"protocol_version": 1, "facts": [{"fact": "unrelated fact"}],
+                   "results": [{"title": "Owner policy", "chunk": claim,
+                                "evidence": category, "provenance": "canonical/owner/policy"}]}
+        for envelope in ({"ok": True, "structuredContent": payload},
+                         {"ok": True, "result": json.dumps(payload)}):
+            ctx = _Ctx(envelope)
+            result = module._on_pre_llm_call(ctx, user_message="Which policy governs the change?")
+            assert claim in result["context"]
+            assert "canonical/owner/policy" in result["context"]
+            assert category not in result["context"]
+            assert "unrelated fact" not in result["context"]
+            assert "not authorization" in result["context"]
+            assert "mcp__gbrain__remember" in result["context"]
+            assert claim not in json.dumps(ctx.state.values)
+
+
+def test_metadata_only_or_malformed_rows_cannot_consume_hits_or_result_slots(monkeypatch, tmp_path):
+    module = _load_plugin()
+    monkeypatch.setattr(module, "_kill_switch_path", lambda: tmp_path / "disabled")
+    payload = {"results": [
+        {"title": "Metadata only", "evidence": "keyword_exact"},
+        {"chunk": {"unexpected": "object"}, "evidence": "weak_semantic"},
+        {"chunk": "   ", "text": "Valid fallback passage", "provenance": "canonical/owner/rule"},
+    ]}
+    ctx = _Ctx({"ok": True, "structuredContent": payload}, {"max_results": 1})
+    result = module._on_pre_llm_call(ctx, user_message="Read the relevant current rule.")
+    assert "Valid fallback passage" in result["context"]
+    assert "Metadata only" not in result["context"]
+    assert ctx.state.values["metrics"]["recall_hits"] == 1
+    empty = _Ctx({"ok": True, "structuredContent": {"results": payload["results"][:2]}})
+    empty_result = module._on_pre_llm_call(empty, user_message="Read the relevant current rule.")
+    assert "Memory 1" not in empty_result["context"]
+    assert empty.state.values["metrics"]["recall_hits"] == 0
+    assert "mcp__gbrain__remember" in empty_result["context"]
+
+
+def test_passage_remains_bounded_without_losing_provenance():
+    module = _load_plugin()
+    rendered = module._format_context(
+        [{"chunk": "x" * 20000, "evidence": "keyword_exact", "provenance": "canonical/owner/rule"}],
+        max_results=3, max_chars=6000, capture=True,
+    )
+    assert "x" * 1200 in rendered
+    assert "x" * 1201 not in rendered
+    assert "canonical/owner/rule" in rendered
+    assert "mcp__gbrain__remember" in rendered
+    assert len(rendered) <= 6000
