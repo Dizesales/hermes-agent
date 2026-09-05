@@ -213,7 +213,7 @@ def test_sectioned_projection_creates_index_and_stable_managed_pages(tmp_path):
         "```markdown\n## Not a projected section\n```\n\n"
         "## 2026-01-01 — First\n\nAlpha body updated.\n\n"
         "## 2026-01-02 — Second\n\nBeta body.\n",
-        "update one section",
+        "revise one section",
     )
     second = module.project(policy)
 
@@ -308,3 +308,73 @@ def test_sectioned_projection_rejects_source_without_h2(tmp_path):
 
     with pytest.raises(module.ProjectionError, match="no level-2 headings"):
         module.project(policy)
+
+
+def _retire_alias(module, brain, policy):
+    data = json.loads(policy.read_text())
+    row = {"path": "identity/owner-workspace/AGENTS.md", "target": data["entries"][0]["target"]}
+    data["retired_aliases"] = [row]
+    policy.write_text(json.dumps(data))
+    alias = brain / row["path"]
+    alias.parent.mkdir(parents=True)
+    alias.write_text(
+        "---\ntype: note\ntitle: Superseded identity projection\nstatus: superseded\n---\n\n"
+        "# Projecao antiga aposentada\n\n"
+        "Esta copia deixou de conter instrucoes operacionais. "
+        "Consultar a projecao gerenciada [[canonical/context/decisions]] e reabrir a fonte owner atual.\n"
+        "Historico preservado no Git local; este ponteiro nao concede autoridade.\n"
+    )
+    return alias
+
+
+@pytest.mark.parametrize("check", [True, False])
+def test_retired_instruction_copy_blocks_before_any_projection_write(tmp_path, check):
+    module = _load_projector()
+    source, brain, policy = _repos(tmp_path)
+    alias = _retire_alias(module, brain, policy)
+    alias.write_text("# Old instructions\nAlways load private memory.\n")
+    before = alias.read_bytes()
+    with pytest.raises(module.ProjectionError, match="retired alias changed"):
+        module.project(policy, check=check)
+    assert not (brain / "canonical").exists()
+    assert alias.read_bytes() == before
+
+
+def test_retired_alias_is_read_only_and_follows_a_declared_current_projection(tmp_path):
+    module = _load_projector()
+    source, brain, policy = _repos(tmp_path)
+    alias = _retire_alias(module, brain, policy)
+    before = alias.read_bytes()
+    first = module.project(policy)
+    _commit_source(source, "# A new current rule\n")
+    second = module.project(policy)
+    assert first["retired_aliases"] == second["retired_aliases"]
+    assert alias.read_bytes() == before
+    assert (brain / "canonical/context/decisions.md").read_text() == "# A new current rule\n"
+    assert "[[canonical/context/decisions]]" in alias.read_text()
+
+
+@pytest.mark.parametrize("alteration", ["missing", "symlink", "traversal", "undeclared_target", "duplicate", "outside_identity"])
+def test_retired_alias_rejects_unsafe_or_inconsistent_policy_without_writes(tmp_path, alteration):
+    module = _load_projector()
+    source, brain, policy = _repos(tmp_path)
+    alias = _retire_alias(module, brain, policy)
+    data = json.loads(policy.read_text())
+    if alteration == "missing":
+        alias.unlink()
+    elif alteration == "symlink":
+        alias.unlink()
+        alias.symlink_to(source / "context/decisions.md")
+    elif alteration == "traversal":
+        data["retired_aliases"][0]["path"] = "identity/../outside.md"
+    elif alteration == "undeclared_target":
+        data["retired_aliases"][0]["target"] = "canonical/undeclared.md"
+    elif alteration == "duplicate":
+        data["retired_aliases"] *= 2
+    else:
+        data["retired_aliases"][0]["path"] = "canonical/old.md"
+    policy.write_text(json.dumps(data))
+    with pytest.raises(module.ProjectionError):
+        module.project(policy)
+    assert not (brain / "canonical").exists()
+    assert (source / "context/decisions.md").read_text() == "# Committed\n"

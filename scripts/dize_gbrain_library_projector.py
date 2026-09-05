@@ -318,6 +318,46 @@ def _atomic_write(path: Path, data: bytes) -> None:
             pass
 
 
+def _retired_alias_content(target: str) -> bytes:
+    slug = target[:-3].casefold()
+    return (
+        "---\ntype: note\ntitle: Superseded identity projection\nstatus: superseded\n---\n\n"
+        "# Projecao antiga aposentada\n\n"
+        "Esta copia deixou de conter instrucoes operacionais. "
+        f"Consultar a projecao gerenciada [[{slug}]] e reabrir a fonte owner atual.\n"
+        "Historico preservado no Git local; este ponteiro nao concede autoridade.\n"
+    ).encode("utf-8")
+
+
+def _check_retired_aliases(raw: Any, brain_repo: Path, targets: set[str]) -> list[dict[str, str]]:
+    """Read-only guard: retirement itself requires a separate owner migration."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or len(raw) > 32:
+        raise ProjectionError("retired_aliases must be a list of at most 32 entries")
+    results = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != {"path", "target"}:
+            raise ProjectionError("retired alias requires only path and target")
+        relative = _relative_markdown(item["path"], "retired alias path")
+        parts = PurePosixPath(relative).parts
+        if parts[0] != "identity" or any(part.startswith(".") for part in parts):
+            raise ProjectionError("retired alias must stay below identity/")
+        if relative in seen:
+            raise ProjectionError("duplicate retired alias")
+        seen.add(relative)
+        target = _relative_markdown(item["target"], "retired alias target", canonical=True)
+        if target not in targets:
+            raise ProjectionError("retired alias target is not an active projection")
+        path = _assert_safe_target(brain_repo, relative)
+        expected = _retired_alias_content(target)
+        if not path.is_file() or path.stat().st_size != len(expected) or path.read_bytes() != expected:
+            raise ProjectionError(f"retired alias changed or missing: {relative}")
+        results.append({"path": relative, "target": target, "sha256": _sha256(expected)})
+    return results
+
+
 def project(policy_path: Path, *, check: bool = False) -> dict[str, Any]:
     policy = _load_policy(policy_path)
     source_repo = _root(policy.get("source_repo"), "source_repo")
@@ -396,6 +436,8 @@ def project(policy_path: Path, *, check: bool = False) -> dict[str, Any]:
                 )
             stale.append((source, relative, path, existing))
 
+    retired_aliases = _check_retired_aliases(policy.get("retired_aliases"), brain_repo, seen_targets)
+
     results: list[dict[str, Any]] = []
     for source, target_rel, target, data in prepared:
         existing = target.read_bytes() if target.exists() else None
@@ -436,6 +478,7 @@ def project(policy_path: Path, *, check: bool = False) -> dict[str, Any]:
         "source_repo": str(source_repo),
         "brain_repo": str(brain_repo),
         "entries": results,
+        "retired_aliases": retired_aliases,
         "changed": sum(
             item["action"] in {"updated", "would_update", "deleted", "would_delete"}
             for item in results
