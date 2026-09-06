@@ -613,3 +613,33 @@ def test_gateway_drain_retains_and_formats_overflow_events():
     out_released = _format_gateway_process_notification(released)
     assert "notifications resumed" in out_released
     assert "exit code" not in out_released
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("results, expected_status, expected_calls", [
+    ([(True, False)], "DELIVERED", 1),
+    ([(False, True), (True, False)], "DELIVERED", 2),
+    ([(False, True)] * 3, "FAILED", 3),
+    ([(False, False)], "FAILED", 1),
+])
+async def test_completion_delivery_receipt(monkeypatch, tmp_path, results, expected_status, expected_calls):
+    import tools.process_registry as pr_module
+    from gateway.platforms.base import SendResult
+    done = SimpleNamespace(output_buffer="done", exited=True, exit_code=0,
+                           command="test", started_at=None)
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry([done]))
+    async def instant_sleep(*a, **kw): pass
+    monkeypatch.setattr(asyncio, "sleep", instant_sleep)
+    runner = _build_runner(monkeypatch, tmp_path, "concise")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter.send.side_effect = [SendResult(success=ok, retryable=retry,
+        message_id="receipt" if ok else None, error=None if ok else "delivery failed")
+        for ok, retry in results]
+    watcher = _watcher_dict(thread_id="4")
+    await runner._run_process_watcher(watcher)
+    assert watcher["delivery"]["status"] == expected_status
+    assert adapter.send.await_count == expected_calls
+    for call in adapter.send.await_args_list:
+        assert call.kwargs["metadata"]["thread_id"] == "4"
+    if expected_status == "DELIVERED":
+        assert watcher["delivery"]["message_id"] == "receipt"

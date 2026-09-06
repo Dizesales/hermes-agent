@@ -1564,6 +1564,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
     already contains HTML tags, it is sent with ``parse_mode='HTML'``
     instead, bypassing MarkdownV2 conversion.
     """
+    _direct_request = None
     try:
         from telegram import Bot
         from telegram.constants import ParseMode
@@ -1609,7 +1610,14 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 logger.warning("send_message: failed to attach Telegram proxy (%s), falling back to direct connection", _proxy_err)
                 bot = Bot(token=token)
         else:
-            bot = Bot(token=token)
+            from telegram.request import HTTPXRequest
+            from plugins.platforms.telegram.telegram_network import (
+                TelegramFallbackTransport, SEED_FALLBACK_IPS,
+            )
+            _direct_request = HTTPXRequest(
+                httpx_kwargs={"transport": TelegramFallbackTransport(SEED_FALLBACK_IPS)}
+            )
+            bot = Bot(token=token, request=_direct_request)
         from plugins.platforms.telegram.telegram_ids import (
             normalize_telegram_chat_id,
         )
@@ -1866,6 +1874,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             "platform": "telegram",
             "chat_id": chat_id,
             "message_id": str(last_msg.message_id),
+            "thread_id": getattr(last_msg, "message_thread_id", None),
+            "telegram_chat_id": getattr(getattr(last_msg, "chat", None), "id", None),
         }
         if warnings:
             result["warnings"] = warnings
@@ -1874,6 +1884,12 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return {"error": "python-telegram-bot not installed. Run: pip install python-telegram-bot"}
     except Exception as e:
         return _error(f"Telegram send failed: {e}")
+    finally:
+        if _direct_request is not None:
+            try:
+                await _direct_request.shutdown()
+            except Exception:
+                logger.debug("Standalone Telegram transport cleanup failed", exc_info=True)
 
 
 # _send_slack moved to the slack plugin as _standalone_send

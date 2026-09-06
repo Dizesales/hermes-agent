@@ -28082,16 +28082,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if p.value == platform_name:
                             adapter = a
                             break
+                    watcher["delivery"] = {
+                        "status": "FAILED", "chat_id": chat_id,
+                        "thread_id": thread_id, "message_id": None,
+                    }
                     if adapter and chat_id:
                         try:
                             send_meta = {"thread_id": thread_id} if thread_id else None
-                            await adapter.send(
-                                chat_id,
-                                message_text,
-                                metadata=_non_conversational_metadata(send_meta, platform=platform_name),
-                            )
+                            for attempt in range(3):
+                                result = await adapter.send(
+                                    chat_id,
+                                    message_text,
+                                    metadata=_non_conversational_metadata(send_meta, platform=platform_name),
+                                )
+                                if result.success is True:
+                                    watcher["delivery"].update(
+                                        status="DELIVERED", message_id=result.message_id,
+                                    )
+                                    break
+                                # Only explicit safe-to-retry failures qualify.
+                                # An ambiguous timeout can already have delivered.
+                                if result.retryable is not True or attempt == 2:
+                                    break
+                                delay = result.retry_after
+                                await asyncio.sleep(delay if delay is not None else 2 ** (attempt + 1))
                         except Exception as e:
-                            logger.error("Watcher delivery error: %s", e)
+                            logger.error("Watcher delivery error: %s", _redact_gateway_user_facing_secrets(str(e)))
+                    if watcher["delivery"]["status"] != "DELIVERED":
+                        logger.error(
+                            "Process %s completed but notification delivery failed (platform=%s, chat=%s, thread=%s)",
+                            session_id, platform_name, chat_id, thread_id,
+                        )
                 break
 
             elif has_new_output and notify_mode == "all" and not agent_notify:

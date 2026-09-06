@@ -22057,6 +22057,10 @@ def main(
             cli._seeded_first_message = _SeededQueryMessage(seeded_query, seeded_images)
             cli.run()
             return
+        # This entry point has no next turn to consume async completions.
+        from gateway.session_context import declare_stateless_channel
+        declare_stateless_channel()
+
         # One-shot mode: no between-turns MCP late-binding refresh, so the
         # agent must wait the full MCP cold-start bound before its first
         # (and only) tool snapshot. See #51316.
