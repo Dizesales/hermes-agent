@@ -1016,3 +1016,19 @@ All the same commands work with `/skills`:
 ```
 
 Official optional skills still use identifiers like `official/security/1password` and `official/migration/openclaw-migration`.
+
+## Skill selection policy
+
+`skills.selection_policy` controls selection guidance for the current profile.
+The default, `broad`, preserves the existing guidance. Set it to `task_relevant`
+to load explicitly requested skills, required workflows, and skills whose
+purpose directly supports the task, while avoiding keyword-only or tangential
+matches. Unclear but plausible matches may still be inspected. Required safety,
+quality and project procedures remain applicable.
+
+This setting does not hide skills, remove tools, change permissions, or cap the
+number of skills a task can use. Invalid values fall back to `broad`. It changes
+guidance for newly built session prompts; it does not rebuild active conversation
+prompts. Start a new session after changing it. Restore `broad` to revert the
+guidance for subsequent sessions. Compare accepted-task quality, latency and
+usage before extending a pilot; shorter guidance alone does not prove savings.

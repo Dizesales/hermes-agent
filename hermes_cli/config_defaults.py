@@ -2256,6 +2256,9 @@ DEFAULT_CONFIG = {
     # Each path is expanded (~, ${VAR}) and resolved.  Read-only — skill creation
     # always goes to ~/.hermes/skills/.
     "skills": {
+        # Selection guidance only; never hides skills or changes tool access.
+        # task_relevant requires a clear task/workflow match; broad is legacy.
+        "selection_policy": "broad",
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
         # Project-local skill discovery: when a session starts inside a git
         # checkout, ``<root>/.hermes/skills/`` and ``<root>/.agents/skills/``

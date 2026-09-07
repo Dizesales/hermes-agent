@@ -1835,6 +1835,14 @@ def _build_skills_system_prompt_inner(
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
+    from hermes_cli.config import load_config_readonly
+    skills_config = load_config_readonly().get("skills", {})
+    selection_policy = (
+        skills_config.get("selection_policy", "broad")
+        if isinstance(skills_config, dict) else "broad"
+    )
+    if selection_policy not in ("broad", "task_relevant"):
+        selection_policy = "broad"
     disabled = get_disabled_skill_names(_platform_hint or None)
     project_dirs = project_dirs or []
     cache_key = (
@@ -1846,6 +1854,7 @@ def _build_skills_system_prompt_inner(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        selection_policy,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -2110,8 +2119,7 @@ def _build_skills_system_prompt_inner(
                 else:
                     index_lines.append(f"    - {name}")
 
-        result = (
-            "## Skills\n"
+        selection_guidance = (
             "Before replying, scan the skills below. If a skill matches or is even partially relevant "
             "to your task, you MUST load it with skill_view(name) and follow its instructions. "
             "Err on the side of loading — it is always better to have context you don't need "
@@ -2122,7 +2130,23 @@ def _build_skills_system_prompt_inner(
             "Skills also encode the user's preferred approach, conventions, and quality standards "
             "for tasks like code review, planning, and testing — load them even for tasks you "
             "already know how to do, because the skill defines how it should be done here.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
+        )
+        selection_footer = "Only proceed without loading a skill if genuinely none are relevant to the task."
+        if selection_policy == "task_relevant":
+            selection_guidance = (
+                "Review the skill names and descriptions below. Load a skill with skill_view(name) "
+                "when the user explicitly requests it, an applicable instruction requires its workflow, "
+                "or its stated purpose directly supports the current task. Follow its instructions. "
+                "Choose the smallest relevant set; do not load skills only because of shared keywords "
+                "or tangential relevance. Required safety, quality and project procedures still apply. "
+                "When a description is insufficient to assess a plausible match, inspect that skill. "
+                "Keep all needed capabilities and load further skills when the task calls for them.\n"
+            )
+            selection_footer = "Proceed without loading a skill when none meets these criteria."
+        result = (
+            "## Skills\n"
+            + selection_guidance
+            + "If a skill has issues, fix it with skill_manage(action='patch').\n"
             "After difficult/iterative tasks, offer to save as a skill. "
             "If a skill you loaded was missing steps, had wrong commands, or needed "
             "pitfalls you discovered, update it before finishing.\n"
@@ -2131,7 +2155,7 @@ def _build_skills_system_prompt_inner(
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            + selection_footer
             + hidden_note
         )
 
