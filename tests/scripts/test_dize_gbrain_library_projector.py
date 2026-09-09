@@ -522,4 +522,12 @@ def test_publication_only_queues_on_protected_change(tmp_path, monkeypatch):
         m.after_publication(policy,receipts,state,unit)
     state.write_text(json.dumps({'status':'SYNCED','commit':head()}))
     assert m.after_publication(policy,receipts,state,unit)['status']=='REFRESH_QUEUED'
-    assert calls==[['/usr/bin/systemctl','start','--no-block',unit]]
+    assert calls==[['/usr/bin/systemctl','restart','--no-block',unit]]
+
+
+
+def test_index_guard_accepts_native_sync_progress_before_json(tmp_path):
+    m, _, _, policy, receipts = _indexed_fixture(tmp_path)
+    path=receipts/'03-sync.json'
+    path.write_text('Syncing changed canonical pages...\n'+path.read_text())
+    assert m.check_index(policy,receipts)['status']=='CURRENT'

@@ -558,7 +558,8 @@ def check_index(policy_path: Path, receipt_dir: Path) -> dict[str, Any]:
     brain = _root(policy.get("brain_repo"), "brain_repo")
     directory = receipt_dir.resolve(strict=True)
     report = json.loads((directory / "00-library-projection.json").read_text())
-    sync = json.loads((directory / "03-sync.json").read_text())
+    sync_text = (directory / "03-sync.json").read_text()
+    sync = json.loads(sync_text[sync_text.find("{"):])
     doctor = json.loads((directory / "12-doctor.json").read_text())
     phase = sync.get("phases", [])
     if (report.get("status") != "PASS" or report.get("mode") != "apply"
@@ -606,7 +607,8 @@ def after_publication(policy_path: Path, receipt_dir: Path, state_path: Path, un
     except (ProjectionError, OSError, ValueError, KeyError, TypeError):
         if not re.fullmatch(r"dizevolv-gbrain-(atena|atlas|arconte)-maintenance\.service", unit):
             raise ProjectionError("invalid maintenance unit")
-        subprocess.run(["/usr/bin/systemctl", "start", "--no-block", unit], check=True, timeout=10, capture_output=True)
+        # Replace an active cycle too: start would swallow a newer publication.
+        subprocess.run(["/usr/bin/systemctl", "restart", "--no-block", unit], check=True, timeout=10, capture_output=True)
         return {"status": "REFRESH_QUEUED"}
 
 
