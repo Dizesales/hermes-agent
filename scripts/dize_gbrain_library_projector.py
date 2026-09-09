@@ -80,8 +80,10 @@ def _load_policy(path: Path) -> dict[str, Any]:
         raise ProjectionError(f"cannot parse policy {path}: {exc}") from exc
     if not isinstance(policy, dict):
         raise ProjectionError("policy root must be an object")
-    if policy.get("schema_version") != SCHEMA_VERSION:
-        raise ProjectionError(f"policy schema_version must be {SCHEMA_VERSION}")
+    if policy.get("schema_version") not in {SCHEMA_VERSION, "1.1"}:
+        raise ProjectionError("policy schema_version must be 1.0 or 1.1")
+    if ("managed_roots" in policy) != (policy.get("schema_version") == "1.1"):
+        raise ProjectionError("managed_roots requires policy schema_version 1.1")
     return policy
 
 
@@ -300,6 +302,40 @@ def _managed_stale_sections(
     return stale
 
 
+def _check_managed_roots(raw: Any, brain_repo: Path, expected: set[str]) -> None:
+    """An explicitly exclusive namespace cannot hide abandoned projections.
+
+    Undeclared files require reviewed owner retirement, never automatic pruning.
+    Neighbouring namespaces remain outside this optional policy boundary.
+    """
+    if not isinstance(raw, list) or not raw:
+        raise ProjectionError("managed_roots must be a non-empty list")
+    roots = [_relative_directory(value, "managed root", canonical=True) for value in raw]
+    for index, root in enumerate(roots):
+        if any(root == other or root.startswith(other + "/") or other.startswith(root + "/")
+               for other in roots[:index]):
+            raise ProjectionError("managed roots overlap")
+    if any(not any(target.startswith(root + "/") for root in roots) for target in expected):
+        raise ProjectionError("projection target outside managed roots")
+    def walk_error(error: OSError) -> None:
+        raise ProjectionError("cannot enumerate managed root") from error
+
+    for root in roots:
+        directory = _assert_safe_directory(brain_repo, root)
+        if directory.exists() and not directory.is_dir():
+            raise ProjectionError("managed root is not a directory")
+        if not directory.exists():
+            continue
+        for parent, dirs, files in os.walk(directory, followlinks=False, onerror=walk_error):
+            for name in dirs + files:
+                path = Path(parent) / name
+                relative = path.relative_to(brain_repo).as_posix()
+                if path.is_symlink():
+                    raise ProjectionError(f"managed target is a symlink: {relative}")
+                if name.endswith(".md") and name in files and relative not in expected:
+                    raise ProjectionError(f"undeclared managed target: {relative}")
+
+
 def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -435,6 +471,11 @@ def project(policy_path: Path, *, check: bool = False) -> dict[str, Any]:
                     f"stale managed target conflicts with active target: {relative}"
                 )
             stale.append((source, relative, path, existing))
+
+    if "managed_roots" in policy:
+        _check_managed_roots(
+            policy["managed_roots"], brain_repo, seen_targets | {item[1] for item in stale}
+        )
 
     retired_aliases = _check_retired_aliases(policy.get("retired_aliases"), brain_repo, seen_targets)
 

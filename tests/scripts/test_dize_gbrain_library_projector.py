@@ -378,3 +378,76 @@ def test_retired_alias_rejects_unsafe_or_inconsistent_policy_without_writes(tmp_
         module.project(policy)
     assert not (brain / "canonical").exists()
     assert (source / "context/decisions.md").read_text() == "# Committed\n"
+
+
+@pytest.mark.parametrize("sectioned", [False, True])
+@pytest.mark.parametrize("change", ["remove_entry", "rename_target", "rename_source"])
+def test_managed_root_rejects_orphans_before_writes(tmp_path, sectioned, change):
+    module = _load_projector()
+    source, brain, policy = _repos(tmp_path)
+    _commit_source(source, "# Decisions\n\n## First\n\nWithdraw me.\n")
+    if sectioned:
+        _enable_sections(policy)
+    data = json.loads(policy.read_text())
+    data["schema_version"] = "1.1"; data["managed_roots"] = ["canonical/context"]
+    policy.write_text(json.dumps(data))
+    module.project(policy)
+    old = {p.relative_to(brain): p.read_bytes() for p in brain.rglob("*.md")}
+    (source / "context/lessons.md").write_text("# Retained\n")
+    _git(source, "add", ".")
+    _git(source, "commit", "-qm", "add retained source")
+    retained = {"source": "context/lessons.md", "target": "canonical/context/lessons.md"}
+    if change == "remove_entry":
+        data["entries"] = [retained]
+    elif change == "rename_target":
+        data["entries"][0]["target"] = "canonical/context/renamed.md"
+    else:
+        data["entries"][0] = retained
+    policy.write_text(json.dumps(data))
+    for check in (True, False):
+        with pytest.raises(module.ProjectionError, match="undeclared managed target"):
+            module.project(policy, check=check)
+        assert {p.relative_to(brain): p.read_bytes() for p in brain.rglob("*.md")} == old
+    # Explicit owner retirement of known old projections, then apply succeeds.
+    for rel in old:
+        (brain / rel).unlink()
+    module.project(policy)
+    assert module.project(policy, check=True)["changed"] == 0
+
+
+@pytest.mark.parametrize("roots", [None, "canonical/context", [], ["../escape"], ["canonical/context", "canonical/context/sub"]])
+def test_managed_roots_invalid_contract_blocks_before_write(tmp_path, roots):
+    module = _load_projector()
+    _, brain, policy = _repos(tmp_path)
+    data = json.loads(policy.read_text()); data["schema_version"] = "1.1"; data["managed_roots"] = roots
+    policy.write_text(json.dumps(data))
+    with pytest.raises(module.ProjectionError):
+        module.project(policy)
+    assert not (brain / "canonical").exists()
+
+
+def test_managed_root_preserves_neighbors_and_refuses_symlink(tmp_path):
+    module = _load_projector()
+    _, brain, policy = _repos(tmp_path)
+    data = json.loads(policy.read_text()); data["schema_version"] = "1.1"; data["managed_roots"] = ["canonical/context"]
+    policy.write_text(json.dumps(data))
+    neighbor = brain / "canonical/other/note.md"
+    neighbor.parent.mkdir(parents=True); neighbor.write_text("# Not managed\n")
+    module.project(policy)
+    assert neighbor.read_text() == "# Not managed\n"
+    (brain / "canonical/context/link").symlink_to(neighbor.parent, target_is_directory=True)
+    with pytest.raises(module.ProjectionError, match="symlink"):
+        module.project(policy)
+
+
+@pytest.mark.parametrize("version,roots", [("1.0", ["canonical/context"]), ("1.1", None)])
+def test_managed_policy_cannot_silently_downgrade(tmp_path, version, roots):
+    module = _load_projector()
+    _, brain, policy = _repos(tmp_path)
+    data = json.loads(policy.read_text()); data["schema_version"] = version
+    if roots is not None:
+        data["managed_roots"] = roots
+    policy.write_text(json.dumps(data))
+    with pytest.raises(module.ProjectionError, match="managed_roots requires"):
+        module.project(policy)
+    assert not (brain / "canonical").exists()
