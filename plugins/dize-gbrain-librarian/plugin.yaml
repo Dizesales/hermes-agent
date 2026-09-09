@@ -38,3 +38,9 @@ config_schema:
   capture_review:
     type: boolean
     default: true
+  freshness_policy:
+    type: string
+    default: ""
+  freshness_receipts:
+    type: string
+    default: ""

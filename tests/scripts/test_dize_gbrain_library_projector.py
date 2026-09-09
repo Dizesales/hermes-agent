@@ -451,3 +451,75 @@ def test_managed_policy_cannot_silently_downgrade(tmp_path, version, roots):
     with pytest.raises(module.ProjectionError, match="managed_roots requires"):
         module.project(policy)
     assert not (brain / "canonical").exists()
+
+
+def _indexed_fixture(tmp_path):
+    module = _load_projector()
+    source, brain, policy = _repos(tmp_path)
+    data = json.loads(policy.read_text()); data.update(schema_version='1.1', managed_roots=['canonical/context'])
+    policy.write_text(json.dumps(data))
+    report = module.project(policy)
+    _git(brain, 'add', '.'); _git(brain, 'commit', '-qm', 'indexed projection')
+    receipts = tmp_path/'completed'; receipts.mkdir()
+    (receipts/'00-library-projection.json').write_text(json.dumps(report))
+    (receipts/'03-sync.json').write_text(json.dumps({'phases':[{'phase':'sync','status':'ok','details':{'failedFiles':0,'dryRun':False}}]}))
+    (receipts/'12-doctor.json').write_text(json.dumps({'status':'healthy'}))
+    (receipts/'head.after').write_bytes(subprocess.check_output(['git','-C',str(brain),'rev-parse','HEAD']))
+    return module, source, brain, policy, receipts
+
+
+def test_index_fingerprint_ignores_unrelated_commits(tmp_path):
+    m, source, brain, policy, receipts = _indexed_fixture(tmp_path)
+    before = m.check_index(policy, receipts)
+    (source/'unrelated.md').write_text('# Outside protected source\n')
+    _git(source,'add','.'); _git(source,'commit','-qm','unrelated')
+    (brain/'other.md').write_text('# Outside protected projection\n')
+    _git(brain,'add','.'); _git(brain,'commit','-qm','unrelated')
+    assert m.check_index(policy, receipts) == before
+    (source/'context/decisions.md').write_text('# Dirty uncommitted\n')
+    assert m.check_index(policy, receipts) == before
+
+
+@pytest.mark.parametrize('change', ['source', 'policy', 'dirty_projection', 'untracked_projection', 'partial_sync', 'old_producer', 'missing_receipt'])
+def test_index_guard_rejects_stale_or_incomplete_evidence(tmp_path, change):
+    m, source, brain, policy, receipts = _indexed_fixture(tmp_path)
+    if change == 'source':
+        _commit_source(source, '# Changed\n')
+    elif change == 'policy':
+        data=json.loads(policy.read_text()); data['entries'][0]['target']='canonical/context/renamed.md';policy.write_text(json.dumps(data))
+    elif change == 'dirty_projection':
+        (brain/'canonical/context/decisions.md').write_text('# Changed\n')
+    elif change == 'untracked_projection':
+        (brain/'canonical/context/extra.md').write_text('# Extra\n')
+    elif change == 'partial_sync':
+        (receipts/'03-sync.json').write_text(json.dumps({'phases':[{'phase':'sync','status':'failed'}]}))
+    elif change == 'old_producer':
+        report=json.loads((receipts/'00-library-projection.json').read_text());report['projector_sha256']='0'*64;(receipts/'00-library-projection.json').write_text(json.dumps(report))
+    else:
+        (receipts/'head.after').unlink()
+    with pytest.raises((m.ProjectionError, OSError)):
+        m.check_index(policy, receipts)
+
+
+def test_publication_only_queues_on_protected_change(tmp_path, monkeypatch):
+    m, source, _, policy, receipts = _indexed_fixture(tmp_path)
+    state=tmp_path/'publisher.json'; calls=[]; original=m.subprocess.run
+    def run(args, **kwargs):
+        if args[0]=='/usr/bin/systemctl':
+            calls.append(args);return subprocess.CompletedProcess(args,0)
+        return original(args,**kwargs)
+    monkeypatch.setattr(m.subprocess,'run',run)
+    unit='dizevolv-gbrain-atena-maintenance.service'
+    for status in ['NO_CHANGE','DEFERRED','HOLD','DRY_RUN']:
+        state.write_text(json.dumps({'status':status}))
+        assert m.after_publication(policy,receipts,state,unit)['status']=='SKIPPED'
+    head=lambda: subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD'],text=True).strip()
+    state.write_text(json.dumps({'status':'SYNCED','commit':head()}))
+    assert m.after_publication(policy,receipts,state,unit)['status']=='CURRENT'
+    assert not calls
+    _commit_source(source,'# Changed\n')
+    with pytest.raises(m.ProjectionError, match='owner HEAD'):
+        m.after_publication(policy,receipts,state,unit)
+    state.write_text(json.dumps({'status':'SYNCED','commit':head()}))
+    assert m.after_publication(policy,receipts,state,unit)['status']=='REFRESH_QUEUED'
+    assert calls==[['/usr/bin/systemctl','start','--no-block',unit]]

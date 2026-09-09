@@ -222,3 +222,42 @@ def test_passage_remains_bounded_without_losing_provenance():
     assert "canonical/owner/rule" in rendered
     assert "mcp__gbrain__remember" in rendered
     assert len(rendered) <= 6000
+
+
+def test_stale_index_blocks_before_mcp(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    module = _load_plugin()
+    monkeypatch.setattr(module, '_kill_switch_path', lambda: tmp_path/'disabled')
+    monkeypatch.setattr(module, 'subprocess', SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=20, stdout='{"status":"HOLD"}')), raising=False)
+    ctx = _Ctx({'ok': True, 'structuredContent': {'results': [{'chunk': 'STALE_CONTENT'}]}},
+               {'freshness_policy': '/owner/policy.json', 'freshness_receipts': '/owner/latest'})
+    result = module._on_pre_llm_call(ctx, user_message='Qual e a decisao operacional atual?')
+    assert ctx.calls == []
+    assert 'STALE_CONTENT' not in result['context']
+    assert 'canonical' in result['context']
+
+
+def test_index_generation_change_drops_inflight_passages(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    module = _load_plugin()
+    monkeypatch.setattr(module, '_kill_switch_path', lambda: tmp_path/'disabled')
+    values = iter(['a'*64, 'b'*64])
+    monkeypatch.setattr(module, 'subprocess', SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps({'status':'CURRENT', 'generation':next(values)}))), raising=False)
+    ctx = _Ctx({'ok': True, 'structuredContent': {'results': [{'chunk': 'INFLIGHT_OLD'}]}},
+               {'freshness_policy': '/owner/policy.json', 'freshness_receipts': '/owner/latest'})
+    result = module._on_pre_llm_call(ctx, user_message='Qual e a decisao operacional atual?')
+    assert len(ctx.calls) == 1
+    assert 'INFLIGHT_OLD' not in result['context']
+
+
+def test_current_generation_preserves_recall(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    module = _load_plugin(); calls=[]
+    monkeypatch.setattr(module, '_kill_switch_path', lambda: tmp_path/'disabled')
+    def current(*args, **kwargs):
+        calls.append(args); return SimpleNamespace(returncode=0, stdout=json.dumps({'status':'CURRENT', 'generation':'a'*64}))
+    monkeypatch.setattr(module, 'subprocess', SimpleNamespace(run=current), raising=False)
+    ctx = _Ctx({'ok': True, 'structuredContent': {'results': [{'chunk': 'CURRENT_CONTENT'}]}},
+               {'freshness_policy': '/owner/policy.json', 'freshness_receipts': '/owner/latest'})
+    result = module._on_pre_llm_call(ctx, user_message='Qual e a decisao operacional atual?')
+    assert 'CURRENT_CONTENT' in result['context'] and len(calls) == 2

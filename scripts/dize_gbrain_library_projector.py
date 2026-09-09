@@ -479,6 +479,9 @@ def project(policy_path: Path, *, check: bool = False) -> dict[str, Any]:
 
     retired_aliases = _check_retired_aliases(policy.get("retired_aliases"), brain_repo, seen_targets)
 
+    source_blobs = _source_blobs(source_repo, head, list({item[0] for item in prepared}))
+    policy_sha256 = _policy_digest(policy)
+    projector_sha256 = _sha256(Path(__file__).read_bytes())
     results: list[dict[str, Any]] = []
     for source, target_rel, target, data in prepared:
         existing = target.read_bytes() if target.exists() else None
@@ -516,6 +519,9 @@ def project(policy_path: Path, *, check: bool = False) -> dict[str, Any]:
         "status": "PASS",
         "mode": "check" if check else "apply",
         "source_head": head,
+        "source_blobs": source_blobs,
+        "policy_sha256": policy_sha256,
+        "projector_sha256": projector_sha256,
         "source_repo": str(source_repo),
         "brain_repo": str(brain_repo),
         "entries": results,
@@ -528,6 +534,82 @@ def project(policy_path: Path, *, check: bool = False) -> dict[str, Any]:
     }
 
 
+def _policy_digest(policy: dict[str, Any]) -> str:
+    return _sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode())
+
+
+def _source_blobs(repo: Path, head: str, sources: list[str]) -> dict[str, str]:
+    rows = _run_git(repo, "ls-tree", "-rz", head, "--", *sources).split(b"\0")
+    blobs = {}
+    for row in filter(None, rows):
+        metadata, name = row.split(b"\t", 1)
+        mode, kind, oid = metadata.decode().split()
+        if kind == "blob":
+            blobs[name.decode()] = oid
+    if set(blobs) != set(sources):
+        raise ProjectionError("protected source inventory changed")
+    return blobs
+
+
+def check_index(policy_path: Path, receipt_dir: Path) -> dict[str, Any]:
+    """Verify the last completed cycle using Git metadata, not corpus content."""
+    policy = _load_policy(policy_path)
+    source = _root(policy.get("source_repo"), "source_repo")
+    brain = _root(policy.get("brain_repo"), "brain_repo")
+    directory = receipt_dir.resolve(strict=True)
+    report = json.loads((directory / "00-library-projection.json").read_text())
+    sync = json.loads((directory / "03-sync.json").read_text())
+    doctor = json.loads((directory / "12-doctor.json").read_text())
+    phase = sync.get("phases", [])
+    if (report.get("status") != "PASS" or report.get("mode") != "apply"
+            or len(phase) != 1 or phase[0].get("phase") != "sync"
+            or phase[0].get("status") != "ok"
+            or phase[0].get("details", {}).get("failedFiles") != 0
+            or phase[0].get("details", {}).get("dryRun") is not False
+            or doctor.get("status") not in {"healthy", "warnings"}):
+        raise ProjectionError("index cycle is incomplete")
+    if (report.get("policy_sha256") != _policy_digest(policy)
+            or report.get("projector_sha256") != _sha256(Path(__file__).read_bytes())
+            or report.get("source_repo") != str(source) or report.get("brain_repo") != str(brain)):
+        raise ProjectionError("index policy or producer changed")
+    sources = [_relative_markdown(x.get("source"), "source") for x in policy["entries"]]
+    head = _run_git(source, "rev-parse", "HEAD").decode().strip()
+    blobs = _source_blobs(source, head, sources)
+    if report.get("source_blobs") != blobs:
+        raise ProjectionError("protected sources changed since index cycle")
+    roots = policy.get("managed_roots")
+    if not isinstance(roots, list) or not roots:
+        raise ProjectionError("index guard requires managed roots")
+    paths = [_relative_directory(x, "managed root", canonical=True) for x in roots]
+    paths += [_relative_markdown(x["path"], "retired alias") for x in policy.get("retired_aliases", [])]
+    indexed_head = (directory / "head.after").read_text().strip()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", indexed_head):
+        raise ProjectionError("invalid indexed revision")
+    _run_git(brain, "diff", "--quiet", indexed_head, "--", *paths)
+    if _run_git(brain, "ls-files", "--others", "--exclude-standard", "--", *paths):
+        raise ProjectionError("unindexed projection files")
+    generation = _sha256(json.dumps([str(directory), indexed_head, blobs, report["policy_sha256"]], sort_keys=True).encode())
+    return {"status": "CURRENT", "generation": generation}
+
+
+def after_publication(policy_path: Path, receipt_dir: Path, state_path: Path, unit: str) -> dict[str, Any]:
+    """One event from the existing publisher; no polling or new scheduler."""
+    state = json.loads(state_path.read_text())
+    if state.get("status") != "SYNCED":
+        return {"status": "SKIPPED", "reason": "no publication event"}
+    policy = _load_policy(policy_path)
+    head = _run_git(_root(policy["source_repo"], "source_repo"), "rev-parse", "HEAD").decode().strip()
+    if state.get("commit") != head:
+        raise ProjectionError("publication receipt does not match owner HEAD")
+    try:
+        return check_index(policy_path, receipt_dir)
+    except (ProjectionError, OSError, ValueError, KeyError, TypeError):
+        if not re.fullmatch(r"dizevolv-gbrain-(atena|atlas|arconte)-maintenance\.service", unit):
+            raise ProjectionError("invalid maintenance unit")
+        subprocess.run(["/usr/bin/systemctl", "start", "--no-block", unit], check=True, timeout=10, capture_output=True)
+        return {"status": "REFRESH_QUEUED"}
+
+
 def _write_receipt(path: Path, receipt: dict[str, Any]) -> None:
     data = (json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
     _atomic_write(path, data)
@@ -538,15 +620,27 @@ def main() -> int:
     parser.add_argument("--policy", required=True, type=Path)
     parser.add_argument("--receipt", type=Path)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--check-index", type=Path, help="last completed maintenance directory")
+    parser.add_argument("--after-publication", type=Path, help="existing publisher state")
+    parser.add_argument("--maintenance-unit")
     args = parser.parse_args()
+    if bool(args.after_publication) != bool(args.maintenance_unit) or (args.after_publication and not args.check_index):
+        parser.error("publication requires check-index and maintenance-unit")
+    if args.check_index and (args.check or args.receipt):
+        parser.error("index check cannot write a projection receipt")
     try:
-        receipt = project(args.policy, check=args.check)
+        if args.after_publication:
+            receipt = after_publication(args.policy, args.check_index, args.after_publication, args.maintenance_unit)
+        elif args.check_index:
+            receipt = check_index(args.policy, args.check_index)
+        else:
+            receipt = project(args.policy, check=args.check)
         if args.receipt:
             _write_receipt(args.receipt, receipt)
         print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
         return 0
-    except ProjectionError as exc:
-        print(json.dumps({"status": "HOLD", "error": str(exc)}, ensure_ascii=False))
+    except (ProjectionError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        print(json.dumps({"status": "HOLD", "error": str(exc) if isinstance(exc, ProjectionError) else type(exc).__name__}, ensure_ascii=False))
         return 20
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -239,6 +240,34 @@ def _remember_observed(value: Any) -> bool:
     return False
 
 
+def _freshness_generation(ctx: Any) -> str | None:
+    policy = ctx.get_config("freshness_policy", "")
+    receipts = ctx.get_config("freshness_receipts", "")
+    if not policy and not receipts:
+        return None  # Other owners retain their existing contract until rollout.
+    if not all(isinstance(x, str) and x.startswith("/") for x in (policy, receipts)):
+        return ""
+    try:
+        result = subprocess.run(
+            ["/usr/local/libexec/dize-gbrain-library-projector", "--policy", policy, "--check-index", receipts],
+            capture_output=True, text=True, timeout=1,
+        )
+        data = json.loads(result.stdout)
+        generation = data.get("generation", "")
+        if result.returncode == 0 and data.get("status") == "CURRENT" and re.fullmatch(r"[0-9a-f]{64}", generation):
+            return generation
+    except Exception:
+        pass
+    return ""
+
+
+_STALE_CONTEXT = (
+    "[GBrain librarian] Index evidence is pending or changed during retrieval. "
+    "No recalled passages are supplied. Reopen the owner canonical sources for current evidence; "
+    "do not treat GBrain recall as current until maintenance completes. "
+)
+
+
 def _on_pre_llm_call(
     ctx: Any,
     *,
@@ -263,6 +292,10 @@ def _on_pre_llm_call(
     timeout = _bounded_float(ctx, "timeout_seconds", 5.0, 1.0, 15.0)
     capture = ctx.get_config("capture_review", True) is not False
 
+    generation = _freshness_generation(ctx)
+    if generation == "":
+        return {"context": _STALE_CONTEXT + (_CAPTURE_INSTRUCTION if capture else "")}
+
     started = time.monotonic()
     envelope: Mapping[str, Any] | None = None
     try:
@@ -276,6 +309,8 @@ def _on_pre_llm_call(
             },
             timeout=timeout,
         )
+        if _freshness_generation(ctx) != generation:
+            return {"context": _STALE_CONTEXT + (_CAPTURE_INSTRUCTION if capture else "")}
         items = _recall_items(envelope)
         ok = bool(isinstance(envelope, Mapping) and envelope.get("ok") is True)
     except Exception:
