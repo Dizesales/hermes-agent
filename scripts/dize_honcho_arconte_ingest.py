@@ -244,6 +244,124 @@ def today_run_count(ledger: sqlite3.Connection, policy: dict[str, Any]) -> int:
     return int(row[0]) if row else 0
 
 
+def project_content(original: str, policy: dict[str, Any]) -> tuple[str, bool]:
+    """The exact projection shared by ingestion and its read-only audit."""
+    from agent.redact import redact_sensitive_text
+    content = redact_sensitive_text(
+        original, force=bool(policy.get("redact_secrets", True)),
+        redact_url_credentials=True,
+    ).strip()
+    content = redact_auth_identifiers(content)
+    maximum = int(policy["max_chars_per_message"])
+    if maximum < 1:
+        raise ValueError("invalid projection limit")
+    truncated = len(content) > maximum
+    return content[:maximum], truncated
+
+
+def audit_ingested_page(policy: dict[str, Any], limit: int, after_id: int = 0,
+                       through_id: int | None = None) -> dict[str, Any]:
+    """Read one bounded ledger page and its source IDs; never infer retirement.
+
+The legacy ledger cannot attest peer/session identity or historical projection
+policy. Matching projected bytes therefore never certifies remote freshness.
+No environment, client, writable ledger, or remote API is needed here.
+"""
+    if type(limit) is not int or not 1 <= limit <= int(policy["max_messages_per_run"]):
+        raise ValueError("audit page exceeds policy limit")
+    if type(after_id) is not int or after_id < 0:
+        raise ValueError("invalid audit cursor")
+    if through_id is not None and (type(through_id) is not int or through_id < after_id):
+        raise ValueError("invalid audit upper bound")
+    ledger = source_connection(Path(policy["ledger_db"]))
+    try:
+        ledger.execute("BEGIN")
+        upper = through_id
+        if upper is None:
+            upper = max(after_id, int(ledger.execute(
+                "SELECT COALESCE(MAX(source_message_id),0) FROM ingested_messages"
+            ).fetchone()[0]))
+        rows = ledger.execute(
+            "SELECT source_message_id,source,content_hash FROM ingested_messages "
+            "WHERE source_message_id > ? AND source_message_id <= ? "
+            "ORDER BY source_message_id LIMIT ?", (after_id, upper, limit + 1),
+        ).fetchall()
+    finally:
+        ledger.close()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    counts: Counter[str] = Counter()
+    allowed = {str(x).lower() for x in policy["allowed_sources"]}
+    denied = {str(x).lower() for x in policy.get("denied_sources", [])}
+    chats = {str(x).lower() for x in policy["allowed_chat_types"]}
+    roles = {str(x).lower() for x in policy["allowed_roles"]}
+    source = source_connection(Path(policy["source_db"]))
+    try:
+        source.execute("BEGIN")
+        for saved in rows:
+            saved_source = str(saved["source"]).lower()
+            if saved_source not in allowed or saved_source in denied:
+                counts["policy_scope_excluded"] += 1
+                continue
+            row = source.execute(
+                "SELECT m.role,m.compacted,m.active,m.display_kind,"
+                "s.source,s.chat_type,s.origin_json FROM messages m "
+                "LEFT JOIN sessions s ON s.id=m.session_id WHERE m.id=?",
+                (saved["source_message_id"],),
+            ).fetchone()
+            if row is None:
+                counts["source_missing_unverified"] += 1
+                continue
+            origin_source = str(row["source"] or "").lower()
+            chat = str(row["chat_type"] or "").lower()
+            role = str(row["role"] or "").lower()
+            if origin_source != str(saved["source"]).lower():
+                counts["source_identity_changed"] += 1
+                continue
+            eligible = (
+                origin_source in allowed and origin_source not in denied
+                and chat in chats and role in roles
+                and (policy.get("include_compacted") or not bool(row["compacted"]))
+                and (row["active"] is None or bool(row["active"]))
+                and (policy.get("include_hidden") or str(row["display_kind"] or "").lower() != "hidden")
+                and parse_origin(row["origin_json"], origin_source, chat) is not None
+            )
+            if not eligible:
+                counts["no_longer_eligible"] += 1
+                continue
+            # Read body only after scope/eligibility checks, in the same snapshot.
+            body = source.execute("SELECT content FROM messages WHERE id=?",
+                                  (saved["source_message_id"],)).fetchone()
+            original = str(body["content"] or "")
+            if not original.strip() or INTERNAL_TURN_RE.match(original):
+                counts["no_longer_eligible"] += 1
+                continue
+            content, _ = project_content(original, policy)
+            if not content:
+                counts["no_longer_eligible"] += 1
+                continue
+            saved_hash = saved["content_hash"]
+            if not isinstance(saved_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", saved_hash):
+                counts["ledger_hash_unverified"] += 1
+            elif hashlib.sha256(content.encode("utf-8")).hexdigest() != saved_hash:
+                counts["projected_content_changed"] += 1
+            else:
+                counts["projected_content_matches"] += 1
+    finally:
+        source.close()
+    needs_review = any(value for key, value in counts.items() if key != "projected_content_matches")
+    return {
+        "status": "review_required" if needs_review else "audited",
+        "scanned": len(rows), "counts": dict(sorted(counts.items())),
+        "after_id": after_id, "through_id": upper,
+        "next_after_id": rows[-1]["source_message_id"] if rows else after_id,
+        "has_more": has_more, "identity": "NOT_CHECKED", "remote": "NOT_CHECKED",
+        "retirement": "NOT_AUTHORIZED_BY_ABSENCE", "read_only": True,
+        "scope": "PAGE_ONLY", "snapshots": "INDEPENDENT_READ_TRANSACTIONS",
+        "projection_policy": "CURRENT_ONLY",
+    }
+
+
 def collect_candidates(
     policy: dict[str, Any], secret: bytes, limit: int
 ) -> tuple[list[Candidate], Counter[tuple[str, str, str]], Counter[str]]:
@@ -269,8 +387,6 @@ def collect_candidates(
     selected: list[Candidate] = []
     counts: Counter[tuple[str, str, str]] = Counter()
     rejected: Counter[str] = Counter()
-
-    from agent.redact import redact_sensitive_text
 
     mark_stage("scan_source")
     with source_connection(Path(policy["source_db"])) as con:
@@ -305,19 +421,10 @@ def collect_candidates(
             if INTERNAL_TURN_RE.match(original):
                 rejected["internal_turn"] += 1
                 continue
-            content = redact_sensitive_text(
-                original,
-                force=bool(policy.get("redact_secrets", True)),
-                redact_url_credentials=True,
-            ).strip()
-            content = redact_auth_identifiers(content)
+            content, truncated = project_content(original, policy)
             if not content:
                 rejected["empty_after_redaction"] += 1
                 continue
-            max_chars = int(policy["max_chars_per_message"])
-            truncated = len(content) > max_chars
-            if truncated:
-                content = content[:max_chars]
 
             source_session = str(row["source_session_id"])
             session_basis = str(row["session_key"] or source_session)
@@ -588,6 +695,9 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true", help="write the bounded batch")
     mode.add_argument("--dry-run", action="store_true", help="inspect counts only (default)")
+    mode.add_argument("--audit-ingested", action="store_true", help="read one bounded ledger/source audit page without API or writes")
+    parser.add_argument("--after-id", type=int, default=0)
+    parser.add_argument("--through-id", type=int)
     parser.add_argument("--limit", type=int, help="lower the policy batch cap")
     parser.add_argument("--ignore-quiet-hours", action="store_true", help="manual canary only")
     args = parser.parse_args()
@@ -598,6 +708,14 @@ def main() -> int:
     limit = configured_limit if args.limit is None else args.limit
     if limit < 1 or limit > configured_limit:
         raise ValueError("limit must be within the configured batch cap")
+
+    if not args.audit_ingested and (args.after_id != 0 or args.through_id is not None):
+        parser.error("audit cursors require --audit-ingested")
+    if args.audit_ingested:
+        mark_stage("audit_ingested")
+        receipt = audit_ingested_page(policy, limit, args.after_id, args.through_id)
+        emit(**receipt)
+        return 2 if receipt["status"] == "review_required" else 0
 
     apply_mode = bool(args.apply)
     if apply_mode and not policy.get("enabled"):

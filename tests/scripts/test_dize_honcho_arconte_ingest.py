@@ -189,5 +189,155 @@ class AcknowledgementTests(unittest.TestCase):
         self.assertNotIn('private synthetic content',str(result))
 
 
+class AuditPageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.root=Path(self.tmp.name);self.db=self.root/'source.sqlite';self.ledger=self.root/'ledger.sqlite'
+        import json
+        self.json=json
+        con=sqlite3.connect(self.db)
+        con.executescript("CREATE TABLE sessions(id TEXT PRIMARY KEY,source TEXT,chat_type TEXT,origin_json TEXT); CREATE TABLE messages(id INTEGER PRIMARY KEY,session_id TEXT,content TEXT,role TEXT,compacted INTEGER,active INTEGER,display_kind TEXT);")
+        origin=json.dumps(dict(platform='telegram',chat_type='dm',chat_id='synthetic',user_id='synthetic'))
+        con.execute('INSERT INTO sessions VALUES (?,?,?,?)',('s','telegram','dm',origin));con.commit();con.close()
+        ingest.ledger_connection(self.ledger).close()
+        self.policy=dict(version=1,history_order='newest-first',source_db=str(self.db),ledger_db=str(self.ledger),allowed_sources=['telegram'],denied_sources=['buzz'],allowed_chat_types=['dm'],allowed_roles=['user'],max_messages_per_run=3,max_chars_per_message=1000,include_compacted=False,include_hidden=False)
+        self.insert(1)
+
+    def insert(self, key, text='synthetic original'):
+        con=sqlite3.connect(self.db);con.execute('INSERT INTO messages VALUES (?,?,?,?,?,?,?)',(key,'s',text,'user',0,1,'normal'));con.commit();con.close()
+        con=sqlite3.connect(self.ledger);con.execute('INSERT INTO ingested_messages VALUES (?,?,?,?,?,?)',(key,'telegram','ref'+str(key),'remote'+str(key),hashlib.sha256(text.encode()).hexdigest(),'synthetic'));con.commit();con.close()
+
+    def edit(self,sql,args=()):
+        with sqlite3.connect(self.db) as con:con.execute(sql,args)
+
+    def test_matching_content_never_certifies_identity_or_remote(self):
+        before=(self.db.read_bytes(),self.ledger.read_bytes())
+        result=ingest.audit_ingested_page(self.policy,3)
+        self.assertEqual(result['counts'],{'projected_content_matches':1})
+        self.assertEqual(result['identity'],'NOT_CHECKED');self.assertEqual(result['remote'],'NOT_CHECKED')
+        self.assertEqual(before,(self.db.read_bytes(),self.ledger.read_bytes()))
+
+    def test_changed_content_requires_review(self):
+        self.edit("UPDATE messages SET content='synthetic changed'")
+        result=ingest.audit_ingested_page(self.policy,3)
+        self.assertEqual(result['status'],'review_required');self.assertEqual(result['counts'],{'projected_content_changed':1})
+
+    def test_missing_source_is_not_retirement(self):
+        self.edit('DELETE FROM messages')
+        result=ingest.audit_ingested_page(self.policy,3)
+        self.assertEqual(result['counts'],{'source_missing_unverified':1})
+        self.assertEqual(result['retirement'],'NOT_AUTHORIZED_BY_ABSENCE')
+
+    def test_inactive_hidden_compacted_and_wrong_role_require_review(self):
+        for field,value in [('active',0),('display_kind','hidden'),('compacted',1),('role','tool')]:
+            with self.subTest(field=field):
+                self.edit("UPDATE messages SET active=1,display_kind='normal',compacted=0,role='user'")
+                self.edit('UPDATE messages SET '+field+'=?',(value,))
+                self.assertEqual(ingest.audit_ingested_page(self.policy,3)['counts'],{'no_longer_eligible':1})
+
+    def test_orphan_session_requires_review(self):
+        self.edit('DELETE FROM sessions')
+        self.assertEqual(ingest.audit_ingested_page(self.policy,3)['counts'],{'source_identity_changed':1})
+
+    def test_invalid_origin_does_not_pass_on_content_match(self):
+        self.edit("UPDATE sessions SET origin_json='{}'")
+        self.assertEqual(ingest.audit_ingested_page(self.policy,3)['counts'],{'no_longer_eligible':1})
+
+    def test_source_change_does_not_pass_on_content_match(self):
+        self.edit("UPDATE sessions SET source='discord'")
+        self.assertEqual(ingest.audit_ingested_page(self.policy,3)['counts'],{'source_identity_changed':1})
+
+    def test_legacy_bad_hash_stays_unverified(self):
+        with sqlite3.connect(self.ledger) as con:con.execute("UPDATE ingested_messages SET content_hash='legacy'")
+        self.assertEqual(ingest.audit_ingested_page(self.policy,3)['counts'],{'ledger_hash_unverified':1})
+
+    def test_projection_policy_change_is_detected(self):
+        self.policy['max_chars_per_message']=4
+        self.assertEqual(ingest.audit_ingested_page(self.policy,3)['counts'],{'projected_content_changed':1})
+
+    def test_page_cursor_and_fixed_upper_bound(self):
+        for i in range(2,8):self.insert(i)
+        first=ingest.audit_ingested_page(self.policy,3)
+        self.assertEqual((first['scanned'],first['next_after_id'],first['through_id'],first['has_more']),(3,3,7,True))
+        self.insert(8)
+        second=ingest.audit_ingested_page(self.policy,3,first['next_after_id'],first['through_id'])
+        third=ingest.audit_ingested_page(self.policy,3,second['next_after_id'],second['through_id'])
+        self.assertEqual((second['scanned'],third['scanned'],third['next_after_id'],third['has_more']),(3,1,7,False))
+
+    def test_invalid_cursors_or_size_refused_before_reads(self):
+        with patch.object(ingest,'source_connection',side_effect=AssertionError('must not open')):
+            for args in [(0,0,None),(4,0,None),(1,-1,None),(1,2,1)]:
+                with self.assertRaises(ValueError):ingest.audit_ingested_page(self.policy,*args)
+
+    def test_missing_database_does_not_create_it(self):
+        self.policy['source_db']=str(self.root/'missing.sqlite')
+        with self.assertRaises(sqlite3.OperationalError):ingest.audit_ingested_page(self.policy,3)
+        self.assertFalse(Path(self.policy['source_db']).exists())
+
+    def test_audit_does_not_call_ingestion_or_client_environment(self):
+        with patch.object(ingest,'ledger_connection',side_effect=AssertionError('no writes')),patch.object(ingest,'load_env',side_effect=AssertionError('no credentials')),patch.object(ingest,'ingested_ids',side_effect=AssertionError('no full ledger')):
+            self.assertEqual(ingest.audit_ingested_page(self.policy,3)['scanned'],1)
+
+    def test_large_ledger_audit_has_bounded_sql_work(self):
+        with sqlite3.connect(self.ledger) as con:
+            con.executemany('INSERT INTO ingested_messages VALUES (?,?,?,?,?,?)',[(i,'telegram','ref'+str(i),'remote'+str(i),'a'*64,'synthetic') for i in range(2,5001)])
+        real=ingest.source_connection;steps=[]
+        def bounded(path):
+            con=real(path)
+            def progress():
+                steps.append(1)
+                return int(len(steps)>10)
+            con.set_progress_handler(progress,100)
+            return con
+        with patch.object(ingest,'source_connection',side_effect=bounded):
+            result=ingest.audit_ingested_page(self.policy,3)
+        self.assertEqual(result['scanned'],3);self.assertTrue(result['has_more'])
+        self.assertLessEqual(len(steps),10)
+
+    def test_cli_audit_never_loads_client_environment(self):
+        import io
+        from contextlib import redirect_stdout
+        policy=self.root/'policy.json';policy.write_text(self.json.dumps(self.policy))
+        self.edit("UPDATE messages SET content='changed'")
+        with patch.object(sys,'argv',['ingest','--policy',str(policy),'--audit-ingested','--limit','2']),patch.object(ingest,'load_env',side_effect=AssertionError('no credentials')),redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ingest.main(),2)
+        self.assertEqual(self.json.loads(out.getvalue())['status'],'review_required')
+
+    def test_forbidden_scope_never_reads_message_body(self):
+        real=ingest.source_connection
+        def guarded(path):
+            con=real(path)
+            con.set_authorizer(lambda action,table,column,*rest: sqlite3.SQLITE_DENY
+                if action==sqlite3.SQLITE_READ and table=='messages' and column=='content'
+                else sqlite3.SQLITE_OK)
+            return con
+        self.edit("UPDATE sessions SET source='discord'")
+        with patch.object(ingest,'source_connection',side_effect=guarded):
+            self.assertEqual(ingest.audit_ingested_page(self.policy,3)['counts'],{'source_identity_changed':1})
+        self.policy['allowed_sources']=['discord']
+        with patch.object(ingest,'source_connection',side_effect=guarded):
+            self.assertEqual(ingest.audit_ingested_page(self.policy,3)['counts'],{'policy_scope_excluded':1})
+
+    def test_existing_ingestion_uses_shared_projection(self):
+        with sqlite3.connect(self.db) as con:
+            for field,kind in [('session_key','TEXT'),('chat_id','TEXT'),('thread_id','TEXT'),('started_at','REAL')]:
+                con.execute('ALTER TABLE sessions ADD COLUMN '+field+' '+kind)
+            con.execute('ALTER TABLE messages ADD COLUMN timestamp REAL')
+        with sqlite3.connect(self.ledger) as con:con.execute('DELETE FROM ingested_messages')
+        self.policy['max_chars_per_message']=4;self.policy['assistant_peer']='assistant'
+        with patch.object(ingest,'gateway_session_id',return_value='synthetic-session'):
+            candidates,counts,rejected=ingest.collect_candidates(self.policy,b'synthetic-key',3)
+        self.assertEqual(len(candidates),1);self.assertEqual(candidates[0].content,'synt')
+        self.assertTrue(candidates[0].metadata['truncated']);self.assertEqual(dict(rejected),{})
+
+    def test_projection_uses_same_redaction_and_truncation(self):
+        text='prefix https://synthetic-user:synthetic-password@example.test end'
+        content,truncated=ingest.project_content(text,self.policy)
+        self.assertNotIn('synthetic-password',content)
+        self.policy['max_chars_per_message']=4
+        short,clipped=ingest.project_content(text,self.policy)
+        self.assertEqual(short,content[:4]);self.assertTrue(clipped)
+
+
 if __name__ == '__main__':
     unittest.main()
