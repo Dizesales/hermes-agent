@@ -501,6 +501,7 @@ def test_index_guard_rejects_stale_or_incomplete_evidence(tmp_path, change):
         m.check_index(policy, receipts)
 
 
+@pytest.mark.linux_only
 def test_publication_only_queues_on_protected_change(tmp_path, monkeypatch):
     m, source, _, policy, receipts = _indexed_fixture(tmp_path)
     state=tmp_path/'publisher.json'; calls=[]; original=m.subprocess.run
@@ -522,7 +523,13 @@ def test_publication_only_queues_on_protected_change(tmp_path, monkeypatch):
         m.after_publication(policy,receipts,state,unit)
     state.write_text(json.dumps({'status':'SYNCED','commit':head()}))
     assert m.after_publication(policy,receipts,state,unit)['status']=='REFRESH_QUEUED'
-    assert calls==[['/usr/bin/systemctl','restart','--no-block',unit]]
+    assert calls==[['/usr/bin/systemctl','start','--no-block',unit]]
+    assert m._publication_pending(receipts).exists()
+    # Worker exit retains one follow-up even if start merged into an active job.
+    assert m.drain_publication(policy,receipts,unit)['status']=='REFRESH_QUEUED'
+    assert len(calls)==2 and not m._publication_pending(receipts).exists()
+    assert m.drain_publication(policy,receipts,unit)['status']=='SKIPPED'
+    assert len(calls)==2
 
 
 

@@ -593,8 +593,19 @@ def check_index(policy_path: Path, receipt_dir: Path) -> dict[str, Any]:
     return {"status": "CURRENT", "generation": generation}
 
 
+def _publication_pending(receipt_dir: Path) -> Path:
+    return receipt_dir.parent / "gbrain-publication.pending.json"
+
+
+def _start_maintenance(unit: str) -> None:
+    if not re.fullmatch(r"dizevolv-gbrain-(atena|atlas|arconte)-maintenance\.service", unit):
+        raise ProjectionError("invalid maintenance unit")
+    subprocess.run(["/usr/bin/systemctl", "start", "--no-block", unit], check=True, timeout=10, capture_output=True)
+
+
 def after_publication(policy_path: Path, receipt_dir: Path, state_path: Path, unit: str) -> dict[str, Any]:
-    """One event from the existing publisher; no polling or new scheduler."""
+    """Coalesce publication events; the existing worker drains them on exit."""
+    import fcntl  # This entry point belongs to the Linux systemd owner service.
     state = json.loads(state_path.read_text())
     if state.get("status") != "SYNCED":
         return {"status": "SKIPPED", "reason": "no publication event"}
@@ -602,14 +613,38 @@ def after_publication(policy_path: Path, receipt_dir: Path, state_path: Path, un
     head = _run_git(_root(policy["source_repo"], "source_repo"), "rev-parse", "HEAD").decode().strip()
     if state.get("commit") != head:
         raise ProjectionError("publication receipt does not match owner HEAD")
-    try:
-        return check_index(policy_path, receipt_dir)
-    except (ProjectionError, OSError, ValueError, KeyError, TypeError):
-        if not re.fullmatch(r"dizevolv-gbrain-(atena|atlas|arconte)-maintenance\.service", unit):
-            raise ProjectionError("invalid maintenance unit")
-        # Replace an active cycle too: start would swallow a newer publication.
-        subprocess.run(["/usr/bin/systemctl", "restart", "--no-block", unit], check=True, timeout=10, capture_output=True)
-        return {"status": "REFRESH_QUEUED"}
+    pending = _publication_pending(receipt_dir)
+    with pending.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            result = check_index(policy_path, receipt_dir)
+        except (ProjectionError, OSError, ValueError, KeyError, TypeError):
+            _write_receipt(pending, {"commit": head, "unit": unit})
+            _start_maintenance(unit)
+            return {"status": "REFRESH_QUEUED"}
+        pending.unlink(missing_ok=True)
+        return result
+
+
+def drain_publication(policy_path: Path, receipt_dir: Path, unit: str) -> dict[str, Any]:
+    """One follow-up at worker exit; clear first so failures cannot loop."""
+    import fcntl
+    pending = _publication_pending(receipt_dir)
+    with pending.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not pending.exists():
+            return {"status": "SKIPPED", "reason": "no pending publication"}
+        request = json.loads(pending.read_text())
+        if request.get("unit") != unit:
+            raise ProjectionError("pending publication owner mismatch")
+        try:
+            result = check_index(policy_path, receipt_dir)
+        except (ProjectionError, OSError, ValueError, KeyError, TypeError):
+            pending.unlink()
+            _start_maintenance(unit)
+            return {"status": "REFRESH_QUEUED"}
+        pending.unlink()
+        return result
 
 
 def _write_receipt(path: Path, receipt: dict[str, Any]) -> None:
@@ -625,13 +660,18 @@ def main() -> int:
     parser.add_argument("--check-index", type=Path, help="last completed maintenance directory")
     parser.add_argument("--after-publication", type=Path, help="existing publisher state")
     parser.add_argument("--maintenance-unit")
+    parser.add_argument("--drain-publication", action="store_true")
     args = parser.parse_args()
-    if bool(args.after_publication) != bool(args.maintenance_unit) or (args.after_publication and not args.check_index):
+    if (bool(args.after_publication or args.drain_publication) != bool(args.maintenance_unit)
+            or ((args.after_publication or args.drain_publication) and not args.check_index)
+            or (args.after_publication and args.drain_publication)):
         parser.error("publication requires check-index and maintenance-unit")
     if args.check_index and (args.check or args.receipt):
         parser.error("index check cannot write a projection receipt")
     try:
-        if args.after_publication:
+        if args.drain_publication:
+            receipt = drain_publication(args.policy, args.check_index, args.maintenance_unit)
+        elif args.after_publication:
             receipt = after_publication(args.policy, args.check_index, args.after_publication, args.maintenance_unit)
         elif args.check_index:
             receipt = check_index(args.policy, args.check_index)
