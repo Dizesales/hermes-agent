@@ -594,7 +594,9 @@ def check_index(policy_path: Path, receipt_dir: Path) -> dict[str, Any]:
 
 
 def _publication_pending(receipt_dir: Path) -> Path:
-    return receipt_dir.parent / "gbrain-publication.pending.json"
+    control = receipt_dir.parent / "publication-control"
+    control.mkdir(mode=0o700, exist_ok=True)
+    return control / "pending.json"
 
 
 def _start_maintenance(unit: str) -> None:
