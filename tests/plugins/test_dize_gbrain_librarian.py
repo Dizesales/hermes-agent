@@ -261,3 +261,18 @@ def test_current_generation_preserves_recall(monkeypatch, tmp_path):
                {'freshness_policy': '/owner/policy.json', 'freshness_receipts': '/owner/latest'})
     result = module._on_pre_llm_call(ctx, user_message='Qual e a decisao operacional atual?')
     assert 'CURRENT_CONTENT' in result['context'] and len(calls) == 2
+
+
+def test_compact_recall_is_opt_in_and_keeps_the_existing_budget(monkeypatch, tmp_path):
+    module = _load_plugin()
+    monkeypatch.setattr(module, "_kill_switch_path", lambda: tmp_path / "disabled")
+    for enabled in (False, True):
+        ctx = _Ctx({"ok": True, "structuredContent": {"results": []}},
+                   {"compact_recall": enabled, "budget_tokens": 900})
+        module._on_pre_llm_call(ctx, user_message="Onde registrar uma decisao duravel?")
+        args = ctx.calls[0][2]
+        assert args["budget_tokens"] == 900 and args["limit"] == 3
+        if enabled:
+            assert args["preserve_lexical"] is True and args["snippet_chars"] == 1200
+        else:
+            assert "preserve_lexical" not in args and "snippet_chars" not in args

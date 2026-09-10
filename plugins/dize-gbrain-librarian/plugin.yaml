@@ -44,3 +44,6 @@ config_schema:
   freshness_receipts:
     type: string
     default: ""
+  compact_recall:
+    type: boolean
+    default: false

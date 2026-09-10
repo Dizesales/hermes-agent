@@ -306,6 +306,8 @@ def _on_pre_llm_call(
                 "query": text[:max_query],
                 "budget_tokens": budget,
                 "limit": max_results,
+                **({"preserve_lexical": True, "snippet_chars": 1200}
+                   if ctx.get_config("compact_recall", False) is True else {}),
             },
             timeout=timeout,
         )
