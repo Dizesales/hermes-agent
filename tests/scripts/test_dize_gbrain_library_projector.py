@@ -502,7 +502,8 @@ def test_index_guard_rejects_stale_or_incomplete_evidence(tmp_path, change):
 
 
 @pytest.mark.linux_only
-def test_publication_only_queues_on_protected_change(tmp_path, monkeypatch):
+@pytest.mark.parametrize("publication_status", ["SYNCED", "NO_CHANGE"])
+def test_publication_only_queues_on_protected_change(tmp_path, monkeypatch, publication_status):
     m, source, _, policy, receipts = _indexed_fixture(tmp_path)
     state=tmp_path/'publisher.json'; calls=[]; original=m.subprocess.run
     def run(args, **kwargs):
@@ -511,17 +512,21 @@ def test_publication_only_queues_on_protected_change(tmp_path, monkeypatch):
         return original(args,**kwargs)
     monkeypatch.setattr(m.subprocess,'run',run)
     unit='dizevolv-gbrain-atena-maintenance.service'
-    for status in ['NO_CHANGE','DEFERRED','HOLD','DRY_RUN']:
+    for status in ['DEFERRED','HOLD','DRY_RUN']:
         state.write_text(json.dumps({'status':status}))
         assert m.after_publication(policy,receipts,state,unit)['status']=='SKIPPED'
     head=lambda: subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD'],text=True).strip()
-    state.write_text(json.dumps({'status':'SYNCED','commit':head()}))
+    state.write_text(json.dumps({'status':publication_status,'commit':head()}))
     assert m.after_publication(policy,receipts,state,unit)['status']=='CURRENT'
     assert not calls
+    state.write_text(json.dumps({'status':publication_status}))
+    with pytest.raises(m.ProjectionError, match='owner HEAD'):
+        m.after_publication(policy,receipts,state,unit)
+    state.write_text(json.dumps({'status':publication_status,'commit':head()}))
     _commit_source(source,'# Changed\n')
     with pytest.raises(m.ProjectionError, match='owner HEAD'):
         m.after_publication(policy,receipts,state,unit)
-    state.write_text(json.dumps({'status':'SYNCED','commit':head()}))
+    state.write_text(json.dumps({'status':publication_status,'commit':head()}))
     assert m.after_publication(policy,receipts,state,unit)['status']=='REFRESH_QUEUED'
     assert calls==[['/usr/bin/systemctl','start','--no-block',unit]]
     assert m._publication_pending(receipts).exists()

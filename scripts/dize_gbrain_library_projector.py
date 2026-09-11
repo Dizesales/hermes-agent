@@ -609,8 +609,9 @@ def after_publication(policy_path: Path, receipt_dir: Path, state_path: Path, un
     """Coalesce publication events; the existing worker drains them on exit."""
     import fcntl  # This entry point belongs to the Linux systemd owner service.
     state = json.loads(state_path.read_text())
-    if state.get("status") != "SYNCED":
-        return {"status": "SKIPPED", "reason": "no publication event"}
+    # A verified no-op sync can recover a missed post-publication event.
+    if state.get("status") not in {"SYNCED", "NO_CHANGE"}:
+        return {"status": "SKIPPED", "reason": "no confirmed sync"}
     policy = _load_policy(policy_path)
     head = _run_git(_root(policy["source_repo"], "source_repo"), "rev-parse", "HEAD").decode().strip()
     if state.get("commit") != head:
