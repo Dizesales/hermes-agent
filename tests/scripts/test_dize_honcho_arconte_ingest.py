@@ -1,4 +1,6 @@
 """Honcho acknowledgement invariants with the real SDK envelope and temp SQLite."""
+from dataclasses import replace
+import json
 import datetime as dt
 import hashlib
 import importlib.util
@@ -67,7 +69,9 @@ class AcknowledgementTests(unittest.TestCase):
         return Message(**values)
 
     def apply(self, candidates=None):
-        return ingest.apply_candidates(self.policy, candidates or [self.candidate])
+        prepared = [replace(c, confirmation={'projection_contract': ingest.projection_contract(self.policy),
+                    'source_version': 'a'*64, 'key_id': 'b'*64, 'gateway_ref': 'd'*64}) for c in (candidates or [self.candidate])]
+        return ingest.apply_candidates(self.policy, prepared)
 
     def rows(self):
         with sqlite3.connect(self.ledger) as con:
@@ -173,6 +177,64 @@ class AcknowledgementTests(unittest.TestCase):
         self.apply()
         self.assertEqual(self.posts,0)
         self.assertEqual(len(self.rows()),1)
+
+    def test_confirmation_binding_saved_and_replay_stays_single(self):
+        self.apply()
+        self.existing = [self.message()]
+        self.apply()
+        with ingest.source_connection(self.ledger) as con:
+            rows = con.execute('SELECT * FROM ingested_messages').fetchall()
+            evidence = con.execute('SELECT evidence_json FROM message_confirmations').fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(evidence), 1)
+        binding = json.loads(evidence[0][0])
+        self.assertEqual(binding['peer'], self.candidate.peer_id)
+        self.assertEqual(binding['session'], self.candidate.session_id)
+        self.assertEqual(binding['workspace'], self.policy['workspace'])
+        self.assertNotIn(self.candidate.content, evidence[0][0])
+        self.assertEqual(ingest.confirmation_state(rows[0], evidence[0][0], ingest.projection_contract(self.policy)), 'RECORDED_CONTRACT_MATCHES')
+
+    def test_failure_between_legacy_and_binding_rolls_back_both(self):
+        con = ingest.ledger_connection(self.ledger)
+        con.execute("CREATE TRIGGER fail_binding BEFORE INSERT ON message_confirmations BEGIN SELECT RAISE(ABORT, 'synthetic'); END")
+        con.commit(); con.close()
+        with self.assertRaises(sqlite3.IntegrityError): self.apply()
+        self.assertEqual(self.rows(), [])
+        with sqlite3.connect(self.ledger) as con:
+            self.assertEqual(con.execute('SELECT COUNT(*) FROM message_confirmations').fetchone()[0], 0)
+            con.execute('DROP TRIGGER fail_binding')
+        self.existing = [self.message()]
+        self.apply()
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.posts, 1)
+
+    def test_legacy_writer_invalidates_binding_and_no_backfill(self):
+        self.apply()
+        with sqlite3.connect(self.ledger) as con:
+            con.execute("UPDATE ingested_messages SET ingested_at='legacy-write'")
+        with ingest.source_connection(self.ledger) as con:
+            row = con.execute('SELECT * FROM ingested_messages').fetchone()
+            evidence = con.execute('SELECT evidence_json FROM message_confirmations').fetchone()[0]
+        self.assertEqual(ingest.confirmation_state(row, evidence, ingest.projection_contract(self.policy)), 'BINDING_UNVERIFIED')
+        self.assertEqual(ingest.confirmation_state(row, None, ingest.projection_contract(self.policy)), 'LEGACY_UNVERIFIED')
+
+    def test_policy_change_without_content_change_detected(self):
+        self.apply()
+        with ingest.source_connection(self.ledger) as con:
+            row = con.execute('SELECT * FROM ingested_messages').fetchone()
+            evidence = con.execute('SELECT evidence_json FROM message_confirmations').fetchone()[0]
+        changed = {**self.policy, 'redact_secrets': False}
+        self.assertEqual(ingest.confirmation_state(row, evidence, ingest.projection_contract(changed)), 'CONTRACT_CHANGED')
+        with patch.object(ingest, 'GOOGLE_OAUTH_CLIENT_ID_RE', __import__('re').compile('changed')):
+            self.assertNotEqual(ingest.projection_contract(self.policy), json.loads(evidence)['projection_contract'])
+
+    def test_unversioned_or_stale_candidate_is_not_acknowledged(self):
+        for evidence in [None, {'projection_contract': 'c'*64, 'source_version': 'a'*64, 'key_id': 'b'*64, 'gateway_ref': 'd'*64}]:
+            with self.subTest(evidence=evidence):
+                with self.assertRaisesRegex(RuntimeError, 'projection contract'):
+                    ingest.apply_candidates(self.policy, [replace(self.candidate, confirmation=evidence)])
+                self.assertFalse(self.ledger.exists())
+                self.assertEqual(self.posts, 0)
 
     def test_real_sdk_page_does_not_fetch_following_pages(self):
         def forbidden_fetch(page):
@@ -329,6 +391,14 @@ class AuditPageTests(unittest.TestCase):
             candidates,counts,rejected=ingest.collect_candidates(self.policy,b'synthetic-key',3)
         self.assertEqual(len(candidates),1);self.assertEqual(candidates[0].content,'synt')
         self.assertTrue(candidates[0].metadata['truncated']);self.assertEqual(dict(rejected),{})
+        first = candidates[0]
+        self.assertEqual(first.confirmation['projection_contract'], ingest.projection_contract(self.policy))
+        self.assertNotIn('synthetic-session', json.dumps(first.confirmation))
+        with patch.object(ingest,'gateway_session_id',return_value='synthetic-session'):
+            changed, _, _ = ingest.collect_candidates(self.policy,b'other-key',3)
+        self.assertNotEqual(first.confirmation['key_id'], changed[0].confirmation['key_id'])
+        self.assertNotEqual(first.confirmation['source_version'], changed[0].confirmation['source_version'])
+        self.assertNotEqual(first.source_ref, changed[0].source_ref)
 
     def test_projection_uses_same_redaction_and_truncation(self):
         text='prefix https://synthetic-user:synthetic-password@example.test end'

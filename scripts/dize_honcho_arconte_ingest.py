@@ -11,6 +11,7 @@ import argparse
 import datetime as dt
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import re
@@ -84,6 +85,7 @@ class Candidate:
     content: str
     created_at: dt.datetime | None
     metadata: dict[str, Any]
+    confirmation: dict[str, str] | None = None
 
 
 def emit(**values: Any) -> None:
@@ -193,6 +195,10 @@ def ledger_connection(path: Path) -> sqlite3.Connection:
           content_hash TEXT NOT NULL,
           ingested_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS message_confirmations (
+          source_message_id INTEGER PRIMARY KEY,
+          evidence_json TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS ingestion_runs (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           started_at TEXT NOT NULL,
@@ -259,12 +265,82 @@ def project_content(original: str, policy: dict[str, Any]) -> tuple[str, bool]:
     return content[:maximum], truncated
 
 
+def projection_contract(policy: dict[str, Any]) -> str:
+    """Fingerprint local transformation code and relevant policy, never credentials."""
+    from agent import redact
+    relevant = {key: policy.get(key) for key in (
+        "version", "redact_secrets", "max_chars_per_message", "allowed_sources",
+        "denied_sources", "allowed_roles", "allowed_chat_types", "include_compacted",
+        "include_hidden", "require_structured_origin", "assistant_peer", "workspace")}
+    implementation = (inspect.getsource(project_content) + inspect.getsource(redact_auth_identifiers)
+                      + GOOGLE_OAUTH_CLIENT_ID_RE.pattern + str(GOOGLE_OAUTH_CLIENT_ID_RE.flags))
+    payload = {"version": 1, "policy": relevant, "implementation": implementation,
+               "redactor": hashlib.sha256(Path(redact.__file__).read_bytes()).hexdigest()}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def validate_confirmation(candidate: Candidate, contract: str) -> None:
+    evidence = candidate.confirmation
+    if (not isinstance(evidence, dict)
+            or set(evidence) != {"projection_contract", "source_version", "key_id", "gateway_ref"}
+            or evidence.get("projection_contract") != contract
+            or any(not re.fullmatch(r"[a-f0-9]{64}", evidence.get(k, ""))
+                   for k in ("projection_contract", "source_version", "key_id", "gateway_ref"))):
+        raise RuntimeError("unverified candidate projection contract")
+
+
+def acknowledge(ledger: sqlite3.Connection, pairs: list[tuple[Candidate, Any]],
+                policy: dict[str, Any]) -> None:
+    """Commit verified legacy acknowledgements and bindings atomically."""
+    contract = projection_contract(policy)
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    records = []
+    for candidate, message in pairs:
+        verify_remote_message(message, candidate, str(policy["workspace"]))
+        evidence = candidate.confirmation
+        validate_confirmation(candidate, contract)
+        legacy = (candidate.source_message_id, candidate.source, candidate.source_ref,
+                  message.id, hashlib.sha256(candidate.content.encode()).hexdigest(), now)
+        binding = {"version": 1, "legacy": legacy, **evidence,
+                   "workspace": str(policy["workspace"]), "session": candidate.session_id,
+                   "peer": candidate.peer_id}
+        records.append((legacy, json.dumps(binding, sort_keys=True)))
+    ledger.execute("BEGIN")
+    try:
+        for legacy, evidence_json in records:
+            ledger.execute("INSERT OR REPLACE INTO ingested_messages VALUES (?,?,?,?,?,?)", legacy)
+            ledger.execute("INSERT OR REPLACE INTO message_confirmations VALUES (?,?)",
+                           (legacy[0], evidence_json))
+        ledger.commit()
+    except BaseException:
+        ledger.rollback()
+        raise
+
+
+def confirmation_state(saved: sqlite3.Row, evidence_json: str | None, contract: str) -> str:
+    if evidence_json is None:
+        return "LEGACY_UNVERIFIED"
+    try:
+        evidence = json.loads(evidence_json)
+        legacy = [saved[k] for k in ("source_message_id", "source", "source_ref",
+                                    "honcho_message_id", "content_hash", "ingested_at")]
+        if (evidence.get("version") != 1 or evidence.get("legacy") != legacy
+                or any(not isinstance(evidence.get(k), str) or not evidence[k]
+                       for k in ("workspace", "session", "peer"))
+                or any(not re.fullmatch(r"[a-f0-9]{64}", evidence.get(k, ""))
+                       for k in ("projection_contract", "source_version", "key_id", "gateway_ref"))):
+            return "BINDING_UNVERIFIED"
+        return "RECORDED_CONTRACT_MATCHES" if evidence["projection_contract"] == contract else "CONTRACT_CHANGED"
+    except (ValueError, TypeError, AttributeError):
+        return "BINDING_UNVERIFIED"
+
+
 def audit_ingested_page(policy: dict[str, Any], limit: int, after_id: int = 0,
                        through_id: int | None = None) -> dict[str, Any]:
     """Read one bounded ledger page and its source IDs; never infer retirement.
 
-The legacy ledger cannot attest peer/session identity or historical projection
-policy. Matching projected bytes therefore never certifies remote freshness.
+Legacy rows cannot attest identity or the historical transformation. New bindings
+attest the recorded acknowledgement only, never current remote freshness.
 No environment, client, writable ledger, or remote API is needed here.
 """
     if type(limit) is not int or not 1 <= limit <= int(policy["max_messages_per_run"]):
@@ -282,10 +358,17 @@ No environment, client, writable ledger, or remote API is needed here.
                 "SELECT COALESCE(MAX(source_message_id),0) FROM ingested_messages"
             ).fetchone()[0]))
         rows = ledger.execute(
-            "SELECT source_message_id,source,content_hash FROM ingested_messages "
+            "SELECT * FROM ingested_messages "
             "WHERE source_message_id > ? AND source_message_id <= ? "
             "ORDER BY source_message_id LIMIT ?", (after_id, upper, limit + 1),
         ).fetchall()
+        has_evidence = ledger.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_confirmations'").fetchone()
+        contract_counts: Counter[str] = Counter()
+        contract = projection_contract(policy)
+        for saved in rows[:limit]:
+            evidence = ledger.execute("SELECT evidence_json FROM message_confirmations WHERE source_message_id=?",
+                                      (saved["source_message_id"],)).fetchone() if has_evidence else None
+            contract_counts[confirmation_state(saved, evidence[0] if evidence else None, contract)] += 1
     finally:
         ledger.close()
     has_more = len(rows) > limit
@@ -349,7 +432,8 @@ No environment, client, writable ledger, or remote API is needed here.
                 counts["projected_content_matches"] += 1
     finally:
         source.close()
-    needs_review = any(value for key, value in counts.items() if key != "projected_content_matches")
+    needs_review = (any(value for key, value in counts.items() if key != "projected_content_matches")
+                    or any(value for key, value in contract_counts.items() if key != "RECORDED_CONTRACT_MATCHES"))
     return {
         "status": "review_required" if needs_review else "audited",
         "scanned": len(rows), "counts": dict(sorted(counts.items())),
@@ -358,7 +442,8 @@ No environment, client, writable ledger, or remote API is needed here.
         "has_more": has_more, "identity": "NOT_CHECKED", "remote": "NOT_CHECKED",
         "retirement": "NOT_AUTHORIZED_BY_ABSENCE", "read_only": True,
         "scope": "PAGE_ONLY", "snapshots": "INDEPENDENT_READ_TRANSACTIONS",
-        "projection_policy": "CURRENT_ONLY",
+        "projection_policy": "RECORDED_WHEN_VERIFIED",
+        "confirmation_counts": dict(sorted(contract_counts.items())),
     }
 
 
@@ -382,6 +467,7 @@ def collect_candidates(
        ORDER BY COALESCE(m.timestamp, s.started_at, 0) DESC, m.id DESC
     """
     params = [*allowed_sources, *allowed_chats, *allowed_roles]
+    contract = projection_contract(policy)
     mark_stage("read_ingest_ledger")
     already = ingested_ids(Path(policy["ledger_db"]))
     selected: list[Candidate] = []
@@ -465,6 +551,14 @@ def collect_candidates(
                     content=content,
                     created_at=to_datetime(row["timestamp"]),
                     metadata=metadata,
+                    confirmation={
+                        "projection_contract": contract,
+                        "source_version": digest(secret, "source-version:" + json.dumps(
+                            [source, source_session, session_basis, role, chat_type, origin, original],
+                            sort_keys=True), length=64),
+                        "key_id": digest(secret, "honcho-confirmation-key-v1", length=64),
+                        "gateway_ref": digest(secret, "gateway:" + honcho_gateway_session, length=64),
+                    },
                 )
             )
             counts[(source, chat_type, role)] += 1
@@ -500,6 +594,9 @@ def verify_remote_message(message: Any, candidate: Candidate, workspace: str) ->
 
 
 def apply_candidates(policy: dict[str, Any], candidates: list[Candidate]) -> dict[str, int]:
+    contract = projection_contract(policy)
+    for candidate in candidates:
+        validate_confirmation(candidate, contract)
     env = load_env(Path(policy["client_env"]))
     token = env.get("HONCHO_API_KEY", "")
     if not token:
@@ -623,18 +720,7 @@ def apply_candidates(policy: dict[str, Any], candidates: list[Candidate]) -> dic
                     to_post.append(candidate)
                     continue
                 verify_remote_message(existing, candidate, str(policy["workspace"]))
-                ledger.execute(
-                    "INSERT OR REPLACE INTO ingested_messages VALUES (?,?,?,?,?,?)",
-                    (
-                        candidate.source_message_id,
-                        candidate.source,
-                        candidate.source_ref,
-                        existing.id,
-                        hashlib.sha256(candidate.content.encode("utf-8")).hexdigest(),
-                        dt.datetime.now(dt.timezone.utc).isoformat(),
-                    ),
-                )
-                ledger.commit()
+                acknowledge(ledger, [(candidate, existing)], policy)
                 deduplicated += 1
 
             if not to_post:
@@ -657,22 +743,7 @@ def apply_candidates(policy: dict[str, Any], candidates: list[Candidate]) -> dic
                 verify_remote_message(message, candidate, str(policy["workspace"]))
             if len({message.id for message in created}) != len(created):
                 raise RuntimeError("duplicate remote message acknowledgement")
-            now = dt.datetime.now(dt.timezone.utc).isoformat()
-            ledger.executemany(
-                "INSERT OR REPLACE INTO ingested_messages VALUES (?,?,?,?,?,?)",
-                [
-                    (
-                        candidate.source_message_id,
-                        candidate.source,
-                        candidate.source_ref,
-                        message.id,
-                        hashlib.sha256(candidate.content.encode("utf-8")).hexdigest(),
-                        now,
-                    )
-                    for candidate, message in zip(to_post, created, strict=True)
-                ],
-            )
-            ledger.commit()
+            acknowledge(ledger, list(zip(to_post, created, strict=True)), policy)
             posted += len(created)
     finally:
         ledger.close()
