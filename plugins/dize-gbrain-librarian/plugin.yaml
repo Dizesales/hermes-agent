@@ -47,3 +47,6 @@ config_schema:
   compact_recall:
     type: boolean
     default: false
+  canonical_references:
+    type: boolean
+    default: false

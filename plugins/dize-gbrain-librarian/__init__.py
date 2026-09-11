@@ -268,6 +268,39 @@ _STALE_CONTEXT = (
 )
 
 
+def _reference_recall(ctx: Any, text: str, budget: int, timeout: float) -> Mapping[str, Any] | None:
+    """Resolve a single explicit document only through the owner's checked policy."""
+    if ctx.get_config("canonical_references", False) is not True:
+        return None
+    refs = set(re.findall(r"(?<![\w./-])(?:/?[\w.-]+/)*[\w.-]+\.md\b", text, re.I))
+    if len(refs) != 1:
+        return None
+    ref = next(iter(refs)).casefold()
+    policy = json.loads(Path(ctx.get_config("freshness_policy", "")).read_text())
+    matches = []
+    for entry in policy["entries"]:
+        source = entry["source"]
+        aliases = [source, str(Path(policy["source_repo"]) / source)] if "/" in ref else [Path(source).name]
+        if ref in [value.casefold() for value in aliases]:
+            matches.append(entry)
+    if not matches:
+        return None
+    if len(matches) != 1:
+        return {"ok": False}  # No guessed owner for an ambiguous basename.
+    target = matches[0]["target"]
+    if not re.fullmatch(r"[A-Za-z0-9_/-]+\.md", target) or target.startswith("/") or ".." in target.split("/"):
+        return {"ok": False}
+    slug = target[:-3].lower()
+    envelope = ctx.call_mcp("gbrain", "recall", {
+        "query": slug, "budget_tokens": budget,
+        "limit": _bounded_int(ctx, "max_results", 3, 1, 8),
+        "preserve_lexical": True, "snippet_chars": 1200,
+    }, timeout=timeout)
+    items = [item for item in _recall_items(envelope) if item.get("slug") == slug]
+    return {"ok": bool(items), "structuredContent": {"results": items[:1]}}
+
+
+
 def _on_pre_llm_call(
     ctx: Any,
     *,
@@ -299,18 +332,20 @@ def _on_pre_llm_call(
     started = time.monotonic()
     envelope: Mapping[str, Any] | None = None
     try:
-        envelope = ctx.call_mcp(
-            "gbrain",
-            "recall",
-            {
-                "query": text[:max_query],
-                "budget_tokens": budget,
-                "limit": max_results,
-                **({"preserve_lexical": True, "snippet_chars": 1200}
-                   if ctx.get_config("compact_recall", False) is True else {}),
-            },
-            timeout=timeout,
-        )
+        envelope = _reference_recall(ctx, text[:max_query], budget, timeout) if generation else None
+        if envelope is None:
+            envelope = ctx.call_mcp(
+                "gbrain",
+                "recall",
+                {
+                    "query": text[:max_query],
+                    "budget_tokens": budget,
+                    "limit": max_results,
+                    **({"preserve_lexical": True, "snippet_chars": 1200}
+                       if ctx.get_config("compact_recall", False) is True else {}),
+                },
+                timeout=timeout,
+            )
         if _freshness_generation(ctx) != generation:
             return {"context": _STALE_CONTEXT + (_CAPTURE_INSTRUCTION if capture else "")}
         items = _recall_items(envelope)

@@ -276,3 +276,73 @@ def test_compact_recall_is_opt_in_and_keeps_the_existing_budget(monkeypatch, tmp
             assert args["preserve_lexical"] is True and args["snippet_chars"] == 1200
         else:
             assert "preserve_lexical" not in args and "snippet_chars" not in args
+
+
+def _reference_fixture(module, tmp_path, entries=None, page=None):
+    policy = tmp_path / 'policy.json'
+    policy.write_text(json.dumps({'source_repo': '/owner', 'entries': entries or [
+        {'source': 'context/MEMORY.md', 'target': 'canonical/context/MEMORY.md'}]}))
+    payload = page or {'results': [{'slug': 'canonical/context/memory', 'chunk': 'Decisions: decisions.md; lessons: lessons.md.'}]}
+    return _Ctx({'ok': True, 'structuredContent': payload}, {
+        'canonical_references': True, 'freshness_policy': str(policy), 'capture_review': False})
+
+
+def test_explicit_reference_case_and_owner_path(tmp_path):
+    module = _load_plugin()
+    for query in ['Onde ficam as decisoes? Consulte MEMORY.md.', 'Explique `memory.md`.', 'Consulte /owner/context/MEMORY.md.', 'Consulte context/MEMORY.md.']:
+        ctx = _reference_fixture(module, tmp_path)
+        result = module._reference_recall(ctx, query, 900, 5)
+        assert 'decisions.md' in result['structuredContent']['results'][0]['chunk']
+        assert ctx.calls[0][1] == 'recall'
+        assert ctx.calls[0][2]['query'] == 'canonical/context/memory'
+
+
+def test_reference_unknown_path_and_normal_query_keep_search(tmp_path):
+    module = _load_plugin()
+    for query in ['Consulte /other/context/MEMORY.md.', 'Onde salvar decisoes?', 'Leia ../MEMORY.md.', 'Leia UNKNOWN.md.']:
+        ctx = _reference_fixture(module, tmp_path)
+        assert module._reference_recall(ctx, query, 900, 5) is None
+        assert ctx.calls == []
+
+
+def test_ambiguous_basename_never_chooses_an_owner(tmp_path):
+    module = _load_plugin()
+    ctx = _reference_fixture(module, tmp_path, entries=[
+        {'source': f'{owner}/MEMORY.md', 'target': f'canonical/{owner}/MEMORY.md'} for owner in ['a', 'b']])
+    assert module._reference_recall(ctx, 'Consulte MEMORY.md.', 900, 5) == {'ok': False}
+    assert ctx.calls == []
+
+
+def test_reference_does_not_accept_wrong_page_or_fact_arm(tmp_path):
+    module = _load_plugin()
+    for payload in [{'results': [], 'facts': [{'text': 'must not inject'}]},
+                    {'results': [{'slug': 'another/source', 'chunk': 'must not inject'}]}]:
+        ctx = _reference_fixture(module, tmp_path, page=payload)
+        result = module._reference_recall(ctx, 'Consulte MEMORY.md.', 900, 5)
+        assert result['ok'] is False and not result['structuredContent']['results']
+
+
+def test_reference_is_opt_in_and_bounded(tmp_path):
+    module = _load_plugin()
+    ctx = _reference_fixture(module, tmp_path, page={'results': [{'slug': 'canonical/context/memory', 'chunk': 'bounded'}]})
+    module._reference_recall(ctx, 'Consulte MEMORY.md.', 128, 5)
+    assert ctx.calls[0][2]['budget_tokens'] == 128
+    assert ctx.calls[0][2]['limit'] == 3
+    ctx.settings['canonical_references'] = False
+    ctx.calls.clear()
+    assert module._reference_recall(ctx, 'Consulte MEMORY.md.', 900, 5) is None
+    assert ctx.calls == []
+
+
+def test_reference_hook_requires_freshness_and_discards_changed_generation(monkeypatch, tmp_path):
+    module = _load_plugin()
+    monkeypatch.setattr(module, '_kill_switch_path', lambda: tmp_path / 'disabled')
+    ctx = _reference_fixture(module, tmp_path)
+    monkeypatch.setattr(module, '_freshness_generation', lambda ctx: '')
+    assert 'No recalled passages' in module._on_pre_llm_call(ctx, user_message='Consulte MEMORY.md.')['context']
+    assert not ctx.calls
+    generations = iter(['a' * 64, 'b' * 64])
+    monkeypatch.setattr(module, '_freshness_generation', lambda ctx: next(generations))
+    result = module._on_pre_llm_call(ctx, user_message='Consulte MEMORY.md.')['context']
+    assert ctx.calls[0][1] == 'recall'
+    assert 'No recalled passages' in result and 'decisions.md' not in result
