@@ -9071,6 +9071,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     )
     _TOKEN_DELTA_COST_FIELDS = ("estimated_cost_usd", "actual_cost_usd")
     _TOKEN_DELTA_ROUTE_FIELDS = (
+        "turn_id",
         "model", "cost_status", "cost_source", "pricing_version",
         "billing_provider", "billing_base_url", "billing_mode",
     )
@@ -9342,6 +9343,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         billing_mode: Optional[str] = None,
         api_call_count: int = 0,
         absolute: bool = False,
+        turn_id: Optional[str] = None,
     ) -> None:
         """Update token counters and backfill model if not already set.
 
@@ -9471,6 +9473,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     (model, billing_provider, billing_base_url, billing_mode, session_id),
                 )
             conn.execute(sql, params)
+            # Same transaction as the aggregate: no observer dispatch, no
+            # second queue. Missing attribution remains absent, not zero.
+            if record_model_usage and isinstance(turn_id, str) and 0 < len(turn_id) <= 256:
+                conn.execute(
+                    """INSERT INTO session_turn_usage (
+                    session_id, turn_id, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, reasoning_tokens, api_call_count
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id, turn_id) DO UPDATE SET
+                    input_tokens = input_tokens + excluded.input_tokens,
+                    output_tokens = output_tokens + excluded.output_tokens,
+                    cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                    cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+                    reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
+                    api_call_count = api_call_count + excluded.api_call_count""",
+                    (session_id, turn_id, input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens, reasoning_tokens, api_call_count),
+                )
             if record_model_usage:
                 self._record_model_usage(
                     conn,
@@ -9964,6 +9984,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "last_heartbeat": r[3], "profile": r[4], "host": r[5],
                 })
         return out
+
+    def get_turn_usage(self, session_id: str, turn_id: str) -> Optional[Dict[str, Any]]:
+        """Read the observed main-loop projection; None means unobserved.
+
+        This is a subset of session totals, not an additional billable bucket.
+        It does not claim coverage of auxiliary or external model executions.
+        """
+        if not self.flush_token_counts():
+            raise TimeoutError("Turn usage is not current: token queue did not drain")
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT * FROM session_turn_usage WHERE session_id = ? AND turn_id = ?",
+                (session_id, turn_id),
+            ).fetchone()
+        return dict(row) if row else None
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""

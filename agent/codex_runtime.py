@@ -231,6 +231,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
             # Enqueued for the SessionDB background writer (see above).
             agent._session_db.queue_token_counts(
                 agent.session_id,
+                turn_id=getattr(agent, "_current_turn_id", None),
                 input_tokens=canonical_usage.input_tokens,
                 output_tokens=canonical_usage.output_tokens,
                 cache_read_tokens=canonical_usage.cache_read_tokens,

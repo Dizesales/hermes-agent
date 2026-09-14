@@ -4488,6 +4488,7 @@ def run_conversation(
                             # turn finalize via _persist_session.
                             agent._session_db.queue_token_counts(
                                 agent.session_id,
+                                turn_id=turn_id,
                                 input_tokens=canonical_usage.input_tokens,
                                 output_tokens=canonical_usage.output_tokens,
                                 cache_read_tokens=canonical_usage.cache_read_tokens,
