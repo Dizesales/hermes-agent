@@ -543,3 +543,65 @@ def test_index_guard_accepts_native_sync_progress_before_json(tmp_path):
     path=receipts/'03-sync.json'
     path.write_text('Syncing changed canonical pages...\n'+path.read_text())
     assert m.check_index(policy,receipts)['status']=='CURRENT'
+
+
+def _runtime_fixture(tmp_path):
+    m, source, brain, policy, receipts = _indexed_fixture(tmp_path)
+    engine = tmp_path / "engine"; engine.write_bytes(b"engine-v1")
+    wrapper = tmp_path / "wrapper"; wrapper.write_text(f'exec {engine} "$@"\n')
+    data = json.loads(policy.read_text()); data["runtime_files"] = [str(wrapper), str(engine)]
+    policy.write_text(json.dumps(data))
+    report = m.project(policy)
+    (receipts / "00-library-projection.json").write_text(json.dumps(report))
+    return m, policy, receipts, wrapper, engine
+
+
+@pytest.mark.parametrize("change", ["engine", "wrapper", "replacement", "target", "missing", "symlink"])
+def test_runtime_binding_rejects_changes(tmp_path, change):
+    m, policy, receipts, wrapper, engine = _runtime_fixture(tmp_path)
+    assert m.check_index(policy, receipts)["status"] == "CURRENT"
+    if change in {"engine", "wrapper"}:
+        path = engine if change == "engine" else wrapper
+        before = path.stat(); raw = path.read_bytes()
+        path.write_bytes(raw.replace(b"v1", b"v2") if change == "engine" else b"#" + raw[1:])
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    elif change == "replacement":
+        other = tmp_path / "replacement"; other.write_bytes(engine.read_bytes()); other.replace(engine)
+    elif change == "target":
+        other = tmp_path / "new-engine"; other.write_bytes(b"new")
+        wrapper.write_text(f'exec {other} "$@"\n')
+        with pytest.raises(m.ProjectionError, match="target"):
+            m.project(policy)  # A new cycle cannot bless the wrong engine.
+    elif change == "missing":
+        engine.unlink()
+    else:
+        other = tmp_path / "other"; engine.rename(other); engine.symlink_to(other)
+    with pytest.raises((m.ProjectionError, OSError)):
+        m.check_index(policy, receipts)
+
+
+def test_runtime_check_does_not_rehash_engine(tmp_path, monkeypatch):
+    m, policy, receipts, wrapper, engine = _runtime_fixture(tmp_path)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("engine hash in read path")
+    monkeypatch.setattr(m.hashlib, "file_digest", forbidden)
+    assert m.check_index(policy, receipts)["status"] == "CURRENT"
+
+
+def test_runtime_change_during_check_is_rejected(tmp_path, monkeypatch):
+    m, policy, receipts, wrapper, engine = _runtime_fixture(tmp_path)
+    original = m._source_blobs
+    def changed(*args):
+        engine.write_bytes(b"engine-v2")
+        return original(*args)
+    monkeypatch.setattr(m, "_source_blobs", changed)
+    with pytest.raises(m.ProjectionError, match="runtime changed"):
+        m.check_index(policy, receipts)
+
+
+def test_runtime_new_cycle_accepts_updated_engine(tmp_path):
+    m, policy, receipts, wrapper, engine = _runtime_fixture(tmp_path)
+    engine.write_bytes(b"engine-v2")
+    report = m.project(policy)
+    (receipts / "00-library-projection.json").write_text(json.dumps(report))
+    assert m.check_index(policy, receipts)["status"] == "CURRENT"

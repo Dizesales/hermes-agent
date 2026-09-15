@@ -17,6 +17,7 @@ import json
 import os
 import re
 import stat
+import shlex
 import subprocess
 import tempfile
 import unicodedata
@@ -394,8 +395,54 @@ def _check_retired_aliases(raw: Any, brain_repo: Path, targets: set[str]) -> lis
     return results
 
 
+def runtime_identity(policy: dict[str, Any], *, digest: bool = False) -> list[dict]:
+    """Hash explicit owner runtime files at indexing; check kernel identity at use.
+
+    ctime detects in-place writes even with restored mtime/size. This trusts the
+    owner filesystem/kernel; it is not attestation against a privileged attacker.
+    """
+    paths = policy.get("runtime_files", [])
+    if not isinstance(paths, list) or any(not isinstance(p, str) for p in paths) or len(set(paths)) != len(paths):
+        raise ProjectionError("invalid runtime file bindings")
+    if "runtime_files" in policy and len(paths) != 2:
+        raise ProjectionError("runtime bindings require wrapper and engine")
+    result = []
+    for value in paths:
+        path = Path(value)
+        if not path.is_absolute() or str(path.resolve(strict=True)) != value:
+            raise ProjectionError("runtime file must be canonical without symlinks")
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ProjectionError("runtime file is not regular")
+            fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_mode")
+            identity = {k: getattr(before, k) for k in fields}
+            row = {"path": value, **identity}
+            if value == paths[0]:
+                if before.st_size > 65536:
+                    raise ProjectionError("runtime wrapper exceeds supported size")
+                lines = stream.read().decode("utf-8").splitlines()
+                commands = [line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")]
+                if not commands or shlex.split(commands[-1]) != ["exec", paths[1], "$@"]:
+                    raise ProjectionError("runtime wrapper target differs from engine binding")
+                stream.seek(0)
+            if digest:
+                row["sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+            if any(getattr(os.fstat(stream.fileno()), k) != v or getattr(path.stat(), k) != v for k, v in identity.items()):
+                raise ProjectionError("runtime file changed during verification")
+            if str(path.resolve(strict=True)) != value:
+                raise ProjectionError("runtime binding changed during verification")
+            result.append(row)
+    return result
+
+
+def _runtime_metadata(rows: list[dict]) -> list[dict]:
+    return [{k: v for k, v in row.items() if k != "sha256"} for row in rows]
+
+
 def project(policy_path: Path, *, check: bool = False) -> dict[str, Any]:
     policy = _load_policy(policy_path)
+    runtime = runtime_identity(policy, digest=True)
     source_repo = _root(policy.get("source_repo"), "source_repo")
     brain_repo = _root(policy.get("brain_repo"), "brain_repo")
     if source_repo == brain_repo:
@@ -514,7 +561,10 @@ def project(policy_path: Path, *, check: bool = False) -> dict[str, Any]:
             }
         )
 
+    if runtime_identity(policy) != _runtime_metadata(runtime):
+        raise ProjectionError("runtime changed during projection")
     return {
+        "runtime_identity": runtime,
         "schema_version": SCHEMA_VERSION,
         "status": "PASS",
         "mode": "check" if check else "apply",
@@ -558,6 +608,9 @@ def check_index(policy_path: Path, receipt_dir: Path) -> dict[str, Any]:
     brain = _root(policy.get("brain_repo"), "brain_repo")
     directory = receipt_dir.resolve(strict=True)
     report = json.loads((directory / "00-library-projection.json").read_text())
+    runtime = runtime_identity(policy)
+    if runtime != _runtime_metadata(report.get("runtime_identity", [])):
+        raise ProjectionError("index runtime changed; completed indexing required")
     sync_text = (directory / "03-sync.json").read_text()
     sync = json.loads(sync_text[sync_text.find("{"):])
     doctor = json.loads((directory / "12-doctor.json").read_text())
@@ -590,6 +643,8 @@ def check_index(policy_path: Path, receipt_dir: Path) -> dict[str, Any]:
     if _run_git(brain, "ls-files", "--others", "--exclude-standard", "--", *paths):
         raise ProjectionError("unindexed projection files")
     generation = _sha256(json.dumps([str(directory), indexed_head, blobs, report["policy_sha256"]], sort_keys=True).encode())
+    if runtime_identity(policy) != runtime:
+        raise ProjectionError("runtime changed during index verification")
     return {"status": "CURRENT", "generation": generation}
 
 
