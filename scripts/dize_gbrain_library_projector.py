@@ -421,9 +421,15 @@ def runtime_identity(policy: dict[str, Any], *, digest: bool = False) -> list[di
             if value == paths[0]:
                 if before.st_size > 65536:
                     raise ProjectionError("runtime wrapper exceeds supported size")
-                lines = stream.read().decode("utf-8").splitlines()
+                lines = stream.read().decode("utf-8").replace("\\\n", "").splitlines()
                 commands = [line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")]
-                if not commands or shlex.split(commands[-1]) != ["exec", paths[1], "$@"]:
+                argv = shlex.split(commands[-1]) if commands else []
+                direct = argv == ["exec", paths[1], "$@"]
+                isolated = (argv[:3] == ["exec", "/usr/bin/env", "-i"]
+                            and argv[-2:] == [paths[1], "$@"]
+                            and all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", x, re.DOTALL)
+                                    for x in argv[3:-2]))
+                if not (direct or isolated):
                     raise ProjectionError("runtime wrapper target differs from engine binding")
                 stream.seek(0)
             if digest:

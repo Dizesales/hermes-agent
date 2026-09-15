@@ -605,3 +605,16 @@ def test_runtime_new_cycle_accepts_updated_engine(tmp_path):
     report = m.project(policy)
     (receipts / "00-library-projection.json").write_text(json.dumps(report))
     assert m.check_index(policy, receipts)["status"] == "CURRENT"
+
+
+@pytest.mark.parametrize("extra", ["", "OTHER=two", "--unknown", "unexpected-command"])
+def test_runtime_env_isolation_wrapper(tmp_path, extra):
+    m, policy, receipts, wrapper, engine = _runtime_fixture(tmp_path)
+    wrapper.write_text('exec /usr/bin/env -i \\\n    PATH=/usr/bin ' + extra + ' \\\n    ' + str(engine) + ' "$@"\n')
+    if extra in {"--unknown", "unexpected-command"}:
+        with pytest.raises(m.ProjectionError, match="target"):
+            m.project(policy)
+    else:
+        report = m.project(policy)
+        (receipts / "00-library-projection.json").write_text(json.dumps(report))
+        assert m.check_index(policy, receipts)["status"] == "CURRENT"
