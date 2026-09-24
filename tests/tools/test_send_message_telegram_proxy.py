@@ -82,7 +82,7 @@ class TestSendTelegramStandaloneProxy:
 
         bot = _make_bot()
         bot_factory = MagicMock(return_value=bot)
-        httpx_request_factory = MagicMock(side_effect=lambda **kw: MagicMock(_kw=kw))
+        httpx_request_factory = MagicMock(side_effect=lambda **kw: MagicMock(_kw=kw, shutdown=AsyncMock()))
         _install_telegram_mock_with_request(monkeypatch, bot_factory, httpx_request_factory)
 
         result: dict[str, Any] = asyncio.run(
@@ -109,13 +109,10 @@ class TestSendTelegramStandaloneProxy:
         # And the bot was actually used to send.
         bot.send_message.assert_awaited_once()
 
-    def test_no_proxy_env_uses_plain_bot(
+    def test_no_proxy_uses_native_fallback_transport(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Without TELEGRAM_PROXY (and no inherited HTTPS_PROXY/etc), Bot()
-        is constructed plainly — no ``request``/``get_updates_request``
-        kwargs, and HTTPXRequest is not invoked at all.
-        """
+        """Direct sends use the same connection fallback as the gateway."""
         from tools.send_message_tool import _send_telegram
 
         # Wipe every env var resolve_proxy_url() inspects so the host's
@@ -143,7 +140,7 @@ class TestSendTelegramStandaloneProxy:
 
         bot = _make_bot()
         bot_factory = MagicMock(return_value=bot)
-        httpx_request_factory = MagicMock(side_effect=lambda **kw: MagicMock(_kw=kw))
+        httpx_request_factory = MagicMock(side_effect=lambda **kw: MagicMock(_kw=kw, shutdown=AsyncMock()))
         _install_telegram_mock_with_request(monkeypatch, bot_factory, httpx_request_factory)
 
         result: dict[str, Any] = asyncio.run(
@@ -156,7 +153,22 @@ class TestSendTelegramStandaloneProxy:
         call_args = bot_factory.call_args.args
         # token may be passed positionally or as a kwarg; either is fine.
         assert call_kwargs.get("token", call_args[0] if call_args else None) == "tok"
-        assert "request" not in call_kwargs
-        assert "get_updates_request" not in call_kwargs
-        httpx_request_factory.assert_not_called()
+        from plugins.platforms.telegram.telegram_network import TelegramFallbackTransport
+        assert "request" in call_kwargs
+        httpx_request_factory.assert_called_once()
+        transport = httpx_request_factory.call_args.kwargs["httpx_kwargs"]["transport"]
+        assert isinstance(transport, TelegramFallbackTransport)
         bot.send_message.assert_awaited_once()
+
+
+def test_native_transport_does_not_retry_ambiguous_delivery():
+    import httpx
+    from plugins.platforms.telegram.telegram_network import TelegramFallbackTransport
+    transport = TelegramFallbackTransport(["149.154.166.110", "149.154.167.220"])
+    sender = SimpleNamespace(handle_async_request=AsyncMock(side_effect=httpx.ReadTimeout("ambiguous response")))
+    transport._get_fallback = AsyncMock(return_value=sender)
+    async def run():
+        with pytest.raises(httpx.ReadTimeout):
+            await transport.handle_async_request(httpx.Request("POST", "https://api.telegram.org/bot-test/sendMessage"))
+    asyncio.run(run())
+    sender.handle_async_request.assert_awaited_once()
