@@ -18,6 +18,7 @@ import {
 interface ProgressProps {
   bootstrap: BootstrapStateModel
 }
+
 /*
  * Progress screen — drives a stage list + collapsible log panel. Uses
  * the DS <Progress> for the top bar so its motion + ring match the rest
@@ -188,3 +189,4 @@ function StateIcon({ state }: { state: StageState | null }) {
 
   return null
 }
+

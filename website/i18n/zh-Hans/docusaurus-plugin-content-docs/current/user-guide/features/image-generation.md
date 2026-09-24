@@ -118,7 +118,7 @@ Make me a futuristic cityscape, landscape orientation
 1. **模型解析** — `_resolve_fal_model()` 读取 `config.yaml` 的 `image_gen.model`，否则看 `FAL_IMAGE_MODEL` 环境变量，再否则默认 `fal-ai/flux-2/klein/9b`。  
 2. **构造请求体** — `_build_fal_payload()` 将 `aspect_ratio` 转为各模型枚举或字面量，合并默认参数与调用方覆盖，并按 `supports` 白名单过滤非法字段。  
 3. **提交** — `_submit_fal_request()` 根据凭据走直连 FAL 或 Nous 托管网关。  
-4. **超分** — 仅当调用显式传入 `upscale: true` 时执行；所有模型目录默认关闭。
+4. **超分** — 仅当调用显式传入 `upscale: true` 时执行；所有模型目录默认关闭。  
 5. **交付** — 最终图像 URL 返回给智能体，并发出 `MEDIA:<url>`，由各平台适配器转为原生媒体消息。  
 
 ## 调试

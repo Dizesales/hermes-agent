@@ -224,5 +224,3 @@ def test_slash_authorization_rejects_cross_guild_role_dm(monkeypatch):
     allowed, reason = adapter._evaluate_slash_authorization(interaction)
     assert allowed is False
     assert "ALLOWED" in (reason or "")
-
-

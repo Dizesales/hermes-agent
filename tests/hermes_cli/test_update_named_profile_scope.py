@@ -1,6 +1,6 @@
 from unittest.mock import patch
 
-from hermes_cli.update_cmd import _sync_named_profiles_on_update_enabled
+from hermes_cli.update_cmd_maint import _sync_named_profiles_on_update_enabled
 
 
 def test_named_profile_update_sync_defaults_enabled():
