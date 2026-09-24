@@ -205,7 +205,7 @@ class TestReadOnlyToolBoundary:
 
         config_path = tmp_path / "honcho.json"
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        GatewayRunner._HONCHO_CACHE_BUSTING_MEMO = {}
+        GatewayRunner._MEMORY_IDENTITY_PROVIDER_MEMO = {}
 
         config_path.write_text(json.dumps({"apiKey": "key", "readOnly": True}))
         guarded = GatewayRunner._extract_cache_busting_config(
@@ -216,8 +216,8 @@ class TestReadOnlyToolBoundary:
             {"memory": {"provider": "honcho"}}
         )
 
-        assert guarded["honcho.read_only"] is True
-        assert writable["honcho.read_only"] is False
+        assert guarded["memory.read_only"] is True
+        assert writable["memory.read_only"] is False
 
 
 class TestReadOnlyLifecycle:
@@ -405,7 +405,6 @@ class TestReadOnlySessionHandles:
         assert manager._flush_session(session) is False
         assert manager.save(session) is None
         assert manager.flush_all() is None
-        assert manager.migrate_local_history("missing", []) is False
         assert manager.migrate_memory_files("missing", "/missing") is False
         assert manager.create_conclusion("missing", "fact") is False
         assert manager.delete_conclusion("missing", "id") is False
@@ -419,3 +418,74 @@ class TestReadOnlySessionHandles:
                 MagicMock(name="assistant_peer"),
             )
         source.assert_not_called()
+
+class TestReadOnlyInjection:
+    def provider(self):
+        provider, manager, _ = _initialized_provider()
+        provider._config.read_only_injection = True
+        provider._config.context_tokens = 500
+        provider._config.session_peer_aliases = {provider._session_key: "group-one"}
+        manager.get_session_context.return_value = {
+            "representation": "The group prefers an evidence-backed receipt.",
+            "card": "Existing conversation context",
+            "ai_representation": "PRIVATE GLOBAL FACT MUST NOT LEAK",
+        }
+        return provider, manager
+
+    def test_opt_in_uses_scoped_context_without_writes_or_dialectic(self):
+        provider, manager = self.provider()
+        memory = MemoryManager()
+        memory.add_provider(provider)
+        result = memory.prefetch_all("How should I report this work?")
+        assert "evidence-backed receipt" in result
+        manager.get_session_context.assert_called_once_with(
+            provider._session_key, peer="group-one", query="How should I report this work?"
+        )
+        assert memory.get_all_tool_names() == {"honcho_profile", "honcho_search", "honcho_context"}
+        provider.queue_prefetch("next turn")
+        manager.prefetch_context.assert_not_called()
+        manager.dialectic_query.assert_not_called()
+        manager.get_or_create.assert_not_called()
+        manager.migrate_memory_files.assert_not_called()
+        assert "automatically retrieved" in provider.system_prompt_block()
+
+    def test_unknown_conversation_does_not_fall_back_to_private_user(self):
+        provider, manager = self.provider()
+        provider._session_key = "another-group"
+        assert provider.prefetch("What do you remember about this project?") == ""
+        manager.get_session_context.assert_not_called()
+
+    def test_reads_fresh_each_turn_and_drops_empty_or_failed_context(self):
+        provider, manager = self.provider()
+        manager.get_session_context.side_effect = [
+            {"representation": "OLD FACT"}, {}, RuntimeError("private error"),
+            {"representation": "NEW FACT"},
+        ]
+        assert "OLD FACT" in provider.prefetch("Recall this project")
+        assert provider.prefetch("Recall this project") == ""
+        assert provider.prefetch("Recall this project") == ""
+        result = provider.prefetch("Recall this project")
+        assert "NEW FACT" in result and "OLD FACT" not in result
+
+    def test_budget_redaction_and_no_global_ai_recall(self):
+        provider, manager = self.provider()
+        client_id = "123456789012-abcdefghijklmnopqrstuvwxyz.apps.googleusercontent.com"
+        manager.get_session_context.return_value = {
+            "representation": client_id + " useful fact" * 1000,
+            "ai_representation": "PRIVATE GLOBAL FACT MUST NOT LEAK",
+            "ai_card": "PRIVATE CARD",
+        }
+        result = provider.prefetch("Recall preferences for this conversation")
+        assert client_id not in result
+        assert "REDACTED_GOOGLE_OAUTH_CLIENT_ID" in result
+        assert "PRIVATE" not in result
+        assert len(result) <= 2002
+
+    def test_opt_in_config_is_explicit_and_host_scoped(self, tmp_path):
+        path = tmp_path / "honcho.json"
+        path.write_text(json.dumps({"readOnlyInjection": True, "hosts": {"hermes": {"readOnlyInjection": False}}}))
+        assert not HonchoClientConfig.from_global_config(config_path=path).read_only_injection
+        path.write_text(json.dumps({"hosts": {"hermes": {"readOnlyInjection": True}}}))
+        assert HonchoClientConfig.from_global_config(config_path=path).read_only_injection
+        path.write_text('{}')
+        assert not HonchoClientConfig.from_global_config(config_path=path).read_only_injection

@@ -17,6 +17,7 @@ import json
 import os
 import re
 import stat
+import shlex
 import subprocess
 import tempfile
 import unicodedata
@@ -80,8 +81,10 @@ def _load_policy(path: Path) -> dict[str, Any]:
         raise ProjectionError(f"cannot parse policy {path}: {exc}") from exc
     if not isinstance(policy, dict):
         raise ProjectionError("policy root must be an object")
-    if policy.get("schema_version") != SCHEMA_VERSION:
-        raise ProjectionError(f"policy schema_version must be {SCHEMA_VERSION}")
+    if policy.get("schema_version") not in {SCHEMA_VERSION, "1.1"}:
+        raise ProjectionError("policy schema_version must be 1.0 or 1.1")
+    if ("managed_roots" in policy) != (policy.get("schema_version") == "1.1"):
+        raise ProjectionError("managed_roots requires policy schema_version 1.1")
     return policy
 
 
@@ -300,6 +303,40 @@ def _managed_stale_sections(
     return stale
 
 
+def _check_managed_roots(raw: Any, brain_repo: Path, expected: set[str]) -> None:
+    """An explicitly exclusive namespace cannot hide abandoned projections.
+
+    Undeclared files require reviewed owner retirement, never automatic pruning.
+    Neighbouring namespaces remain outside this optional policy boundary.
+    """
+    if not isinstance(raw, list) or not raw:
+        raise ProjectionError("managed_roots must be a non-empty list")
+    roots = [_relative_directory(value, "managed root", canonical=True) for value in raw]
+    for index, root in enumerate(roots):
+        if any(root == other or root.startswith(other + "/") or other.startswith(root + "/")
+               for other in roots[:index]):
+            raise ProjectionError("managed roots overlap")
+    if any(not any(target.startswith(root + "/") for root in roots) for target in expected):
+        raise ProjectionError("projection target outside managed roots")
+    def walk_error(error: OSError) -> None:
+        raise ProjectionError("cannot enumerate managed root") from error
+
+    for root in roots:
+        directory = _assert_safe_directory(brain_repo, root)
+        if directory.exists() and not directory.is_dir():
+            raise ProjectionError("managed root is not a directory")
+        if not directory.exists():
+            continue
+        for parent, dirs, files in os.walk(directory, followlinks=False, onerror=walk_error):
+            for name in dirs + files:
+                path = Path(parent) / name
+                relative = path.relative_to(brain_repo).as_posix()
+                if path.is_symlink():
+                    raise ProjectionError(f"managed target is a symlink: {relative}")
+                if name.endswith(".md") and name in files and relative not in expected:
+                    raise ProjectionError(f"undeclared managed target: {relative}")
+
+
 def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -358,8 +395,60 @@ def _check_retired_aliases(raw: Any, brain_repo: Path, targets: set[str]) -> lis
     return results
 
 
+def runtime_identity(policy: dict[str, Any], *, digest: bool = False) -> list[dict]:
+    """Hash explicit owner runtime files at indexing; check kernel identity at use.
+
+    ctime detects in-place writes even with restored mtime/size. This trusts the
+    owner filesystem/kernel; it is not attestation against a privileged attacker.
+    """
+    paths = policy.get("runtime_files", [])
+    if not isinstance(paths, list) or any(not isinstance(p, str) for p in paths) or len(set(paths)) != len(paths):
+        raise ProjectionError("invalid runtime file bindings")
+    if "runtime_files" in policy and len(paths) != 2:
+        raise ProjectionError("runtime bindings require wrapper and engine")
+    result = []
+    for value in paths:
+        path = Path(value)
+        if not path.is_absolute() or str(path.resolve(strict=True)) != value:
+            raise ProjectionError("runtime file must be canonical without symlinks")
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ProjectionError("runtime file is not regular")
+            fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_mode")
+            identity = {k: getattr(before, k) for k in fields}
+            row = {"path": value, **identity}
+            if value == paths[0]:
+                if before.st_size > 65536:
+                    raise ProjectionError("runtime wrapper exceeds supported size")
+                lines = stream.read().decode("utf-8").replace("\\\n", "").splitlines()
+                commands = [line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")]
+                argv = shlex.split(commands[-1]) if commands else []
+                direct = argv == ["exec", paths[1], "$@"]
+                isolated = (argv[:3] == ["exec", "/usr/bin/env", "-i"]
+                            and argv[-2:] == [paths[1], "$@"]
+                            and all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", x, re.DOTALL)
+                                    for x in argv[3:-2]))
+                if not (direct or isolated):
+                    raise ProjectionError("runtime wrapper target differs from engine binding")
+                stream.seek(0)
+            if digest:
+                row["sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+            if any(getattr(os.fstat(stream.fileno()), k) != v or getattr(path.stat(), k) != v for k, v in identity.items()):
+                raise ProjectionError("runtime file changed during verification")
+            if str(path.resolve(strict=True)) != value:
+                raise ProjectionError("runtime binding changed during verification")
+            result.append(row)
+    return result
+
+
+def _runtime_metadata(rows: list[dict]) -> list[dict]:
+    return [{k: v for k, v in row.items() if k != "sha256"} for row in rows]
+
+
 def project(policy_path: Path, *, check: bool = False) -> dict[str, Any]:
     policy = _load_policy(policy_path)
+    runtime = runtime_identity(policy, digest=True)
     source_repo = _root(policy.get("source_repo"), "source_repo")
     brain_repo = _root(policy.get("brain_repo"), "brain_repo")
     if source_repo == brain_repo:
@@ -436,8 +525,16 @@ def project(policy_path: Path, *, check: bool = False) -> dict[str, Any]:
                 )
             stale.append((source, relative, path, existing))
 
+    if "managed_roots" in policy:
+        _check_managed_roots(
+            policy["managed_roots"], brain_repo, seen_targets | {item[1] for item in stale}
+        )
+
     retired_aliases = _check_retired_aliases(policy.get("retired_aliases"), brain_repo, seen_targets)
 
+    source_blobs = _source_blobs(source_repo, head, list({item[0] for item in prepared}))
+    policy_sha256 = _policy_digest(policy)
+    projector_sha256 = _sha256(Path(__file__).read_bytes())
     results: list[dict[str, Any]] = []
     for source, target_rel, target, data in prepared:
         existing = target.read_bytes() if target.exists() else None
@@ -470,11 +567,17 @@ def project(policy_path: Path, *, check: bool = False) -> dict[str, Any]:
             }
         )
 
+    if runtime_identity(policy) != _runtime_metadata(runtime):
+        raise ProjectionError("runtime changed during projection")
     return {
+        "runtime_identity": runtime,
         "schema_version": SCHEMA_VERSION,
         "status": "PASS",
         "mode": "check" if check else "apply",
         "source_head": head,
+        "source_blobs": source_blobs,
+        "policy_sha256": policy_sha256,
+        "projector_sha256": projector_sha256,
         "source_repo": str(source_repo),
         "brain_repo": str(brain_repo),
         "entries": results,
@@ -487,6 +590,127 @@ def project(policy_path: Path, *, check: bool = False) -> dict[str, Any]:
     }
 
 
+def _policy_digest(policy: dict[str, Any]) -> str:
+    return _sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode())
+
+
+def _source_blobs(repo: Path, head: str, sources: list[str]) -> dict[str, str]:
+    rows = _run_git(repo, "ls-tree", "-rz", head, "--", *sources).split(b"\0")
+    blobs = {}
+    for row in filter(None, rows):
+        metadata, name = row.split(b"\t", 1)
+        mode, kind, oid = metadata.decode().split()
+        if kind == "blob":
+            blobs[name.decode()] = oid
+    if set(blobs) != set(sources):
+        raise ProjectionError("protected source inventory changed")
+    return blobs
+
+
+def check_index(policy_path: Path, receipt_dir: Path) -> dict[str, Any]:
+    """Verify the last completed cycle using Git metadata, not corpus content."""
+    policy = _load_policy(policy_path)
+    source = _root(policy.get("source_repo"), "source_repo")
+    brain = _root(policy.get("brain_repo"), "brain_repo")
+    directory = receipt_dir.resolve(strict=True)
+    report = json.loads((directory / "00-library-projection.json").read_text())
+    runtime = runtime_identity(policy)
+    if runtime != _runtime_metadata(report.get("runtime_identity", [])):
+        raise ProjectionError("index runtime changed; completed indexing required")
+    sync_text = (directory / "03-sync.json").read_text()
+    sync = json.loads(sync_text[sync_text.find("{"):])
+    doctor = json.loads((directory / "12-doctor.json").read_text())
+    phase = sync.get("phases", [])
+    if (report.get("status") != "PASS" or report.get("mode") != "apply"
+            or len(phase) != 1 or phase[0].get("phase") != "sync"
+            or phase[0].get("status") != "ok"
+            or phase[0].get("details", {}).get("failedFiles") != 0
+            or phase[0].get("details", {}).get("dryRun") is not False
+            or doctor.get("status") not in {"healthy", "warnings"}):
+        raise ProjectionError("index cycle is incomplete")
+    if (report.get("policy_sha256") != _policy_digest(policy)
+            or report.get("projector_sha256") != _sha256(Path(__file__).read_bytes())
+            or report.get("source_repo") != str(source) or report.get("brain_repo") != str(brain)):
+        raise ProjectionError("index policy or producer changed")
+    sources = [_relative_markdown(x.get("source"), "source") for x in policy["entries"]]
+    head = _run_git(source, "rev-parse", "HEAD").decode().strip()
+    blobs = _source_blobs(source, head, sources)
+    if report.get("source_blobs") != blobs:
+        raise ProjectionError("protected sources changed since index cycle")
+    roots = policy.get("managed_roots")
+    if not isinstance(roots, list) or not roots:
+        raise ProjectionError("index guard requires managed roots")
+    paths = [_relative_directory(x, "managed root", canonical=True) for x in roots]
+    paths += [_relative_markdown(x["path"], "retired alias") for x in policy.get("retired_aliases", [])]
+    indexed_head = (directory / "head.after").read_text().strip()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", indexed_head):
+        raise ProjectionError("invalid indexed revision")
+    _run_git(brain, "diff", "--quiet", indexed_head, "--", *paths)
+    if _run_git(brain, "ls-files", "--others", "--exclude-standard", "--", *paths):
+        raise ProjectionError("unindexed projection files")
+    generation = _sha256(json.dumps([str(directory), indexed_head, blobs, report["policy_sha256"]], sort_keys=True).encode())
+    if runtime_identity(policy) != runtime:
+        raise ProjectionError("runtime changed during index verification")
+    return {"status": "CURRENT", "generation": generation}
+
+
+def _publication_pending(receipt_dir: Path) -> Path:
+    control = receipt_dir.parent / "publication-control"
+    control.mkdir(mode=0o700, exist_ok=True)
+    return control / "pending.json"
+
+
+def _start_maintenance(unit: str) -> None:
+    if not re.fullmatch(r"dizevolv-gbrain-(atena|atlas|arconte)-maintenance\.service", unit):
+        raise ProjectionError("invalid maintenance unit")
+    subprocess.run(["/usr/bin/systemctl", "start", "--no-block", unit], check=True, timeout=10, capture_output=True)
+
+
+def after_publication(policy_path: Path, receipt_dir: Path, state_path: Path, unit: str) -> dict[str, Any]:
+    """Coalesce publication events; the existing worker drains them on exit."""
+    import fcntl  # This entry point belongs to the Linux systemd owner service.
+    state = json.loads(state_path.read_text())
+    # A verified no-op sync can recover a missed post-publication event.
+    if state.get("status") not in {"SYNCED", "NO_CHANGE"}:
+        return {"status": "SKIPPED", "reason": "no confirmed sync"}
+    policy = _load_policy(policy_path)
+    head = _run_git(_root(policy["source_repo"], "source_repo"), "rev-parse", "HEAD").decode().strip()
+    if state.get("commit") != head:
+        raise ProjectionError("publication receipt does not match owner HEAD")
+    pending = _publication_pending(receipt_dir)
+    with pending.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            result = check_index(policy_path, receipt_dir)
+        except (ProjectionError, OSError, ValueError, KeyError, TypeError):
+            _write_receipt(pending, {"commit": head, "unit": unit})
+            _start_maintenance(unit)
+            return {"status": "REFRESH_QUEUED"}
+        pending.unlink(missing_ok=True)
+        return result
+
+
+def drain_publication(policy_path: Path, receipt_dir: Path, unit: str) -> dict[str, Any]:
+    """One follow-up at worker exit; clear first so failures cannot loop."""
+    import fcntl
+    pending = _publication_pending(receipt_dir)
+    with pending.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not pending.exists():
+            return {"status": "SKIPPED", "reason": "no pending publication"}
+        request = json.loads(pending.read_text())
+        if request.get("unit") != unit:
+            raise ProjectionError("pending publication owner mismatch")
+        try:
+            result = check_index(policy_path, receipt_dir)
+        except (ProjectionError, OSError, ValueError, KeyError, TypeError):
+            pending.unlink()
+            _start_maintenance(unit)
+            return {"status": "REFRESH_QUEUED"}
+        pending.unlink()
+        return result
+
+
 def _write_receipt(path: Path, receipt: dict[str, Any]) -> None:
     data = (json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
     _atomic_write(path, data)
@@ -497,15 +721,32 @@ def main() -> int:
     parser.add_argument("--policy", required=True, type=Path)
     parser.add_argument("--receipt", type=Path)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--check-index", type=Path, help="last completed maintenance directory")
+    parser.add_argument("--after-publication", type=Path, help="existing publisher state")
+    parser.add_argument("--maintenance-unit")
+    parser.add_argument("--drain-publication", action="store_true")
     args = parser.parse_args()
+    if (bool(args.after_publication or args.drain_publication) != bool(args.maintenance_unit)
+            or ((args.after_publication or args.drain_publication) and not args.check_index)
+            or (args.after_publication and args.drain_publication)):
+        parser.error("publication requires check-index and maintenance-unit")
+    if args.check_index and (args.check or args.receipt):
+        parser.error("index check cannot write a projection receipt")
     try:
-        receipt = project(args.policy, check=args.check)
+        if args.drain_publication:
+            receipt = drain_publication(args.policy, args.check_index, args.maintenance_unit)
+        elif args.after_publication:
+            receipt = after_publication(args.policy, args.check_index, args.after_publication, args.maintenance_unit)
+        elif args.check_index:
+            receipt = check_index(args.policy, args.check_index)
+        else:
+            receipt = project(args.policy, check=args.check)
         if args.receipt:
             _write_receipt(args.receipt, receipt)
         print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
         return 0
-    except ProjectionError as exc:
-        print(json.dumps({"status": "HOLD", "error": str(exc)}, ensure_ascii=False))
+    except (ProjectionError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        print(json.dumps({"status": "HOLD", "error": str(exc) if isinstance(exc, ProjectionError) else type(exc).__name__}, ensure_ascii=False))
         return 20
 
 
