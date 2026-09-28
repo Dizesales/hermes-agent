@@ -236,7 +236,12 @@ def _value_for(default: Any, rng: random.Random, *, long: bool, env: dict[str, s
     if roll < 0.08:
         return None
     if roll < 0.18:
-        return copy.deepcopy(default) if not isinstance(default, (dict, list)) else None
+        # Same-value-as-default write. Only representable scalars may be
+        # deep-copied: a default-less target (e.g. c18_custom_root) passes the
+        # _MISSING sentinel, which must never be planted in the config tree.
+        if isinstance(default, (bool, int, float, str)) or default is None:
+            return copy.deepcopy(default)
+        return None
     if isinstance(default, bool):
         return rng.random() < 0.5
     if isinstance(default, int):
@@ -295,6 +300,11 @@ def gen_case(seed: int, *, long: bool = False, n_sections: tuple = (5, 11), excl
         if isinstance(tree["skills"], dict):
             tree["skills"]["external_dirs"] = [f"/opt/c18/{rng.choice(_WORDS)}", rng.choice(_UNICODE)]
     tree["_config_version"] = LATEST
+    # Adding a documented section changes seeded sampling. Null-coverage cases must
+    # keep a real null leaf regardless of the number/order of configuration keys.
+    if null_leaves and not any(_get(tree, path) is None for path in _leaves(tree)):
+        path = next(path for path in _leaves(tree) if path[0] in sections)
+        _set(tree, path, None)
 
     lines: list[str] = [f"# C18 generated config (seed={seed}) — comments must survive every write"]
     leaf_lines: dict[tuple, int] = {}
@@ -934,8 +944,11 @@ def test_p3_a_transient_error_on_any_single_read_never_clobbers(op_name, web_app
 
 
 def _truncate_mid_scalar(text: str) -> str:
-    idx = text.index('"', text.index("\n", 10))  # first double-quoted scalar after the header
-    return text[: idx + 5]
+    # Cut inside a YAML quoted scalar, never after its closing quote (a short
+    # scalar could make the previous fixed five-character cut valid YAML).
+    token = next(token for token in yaml.scan(text)
+                 if isinstance(token, yaml.tokens.ScalarToken) and token.style == '"')
+    return text[:token.start_mark.index + 1]
 
 
 _PERSISTENT_FAULTS = {

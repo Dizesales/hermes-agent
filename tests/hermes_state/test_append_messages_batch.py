@@ -252,3 +252,26 @@ class TestShadowedCheckpointRowsArePruned:
         assert messages[3]["codex_reasoning_items"] == [self._reasoning(1), self._checkpoint(1)]
         assert agent._flush_messages_to_session_db(messages) is True
         assert db.message_count("sess-batch") == 4
+
+
+def test_failed_insert_does_not_adopt_reused_row_id(db, monkeypatch):
+    """A committed row that reuses a rolled-back id must not replace the retried message."""
+    message = {"role": "user", "content": "original requested work"}
+    original_insert = db._insert_message_rows
+
+    def fail_after_insert(conn, session_id, messages):
+        original_insert(conn, session_id, messages)
+        assert "_row_id" in messages[0] and "_db_row_snapshot" in messages[0]
+        raise RuntimeError("failure after insert, before commit")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(db, "_insert_message_rows", fail_after_insert)
+        with pytest.raises(RuntimeError, match="failure after insert"):
+            db.append_messages_batch("sess-batch", [message])
+    assert message == {"role": "user", "content": "original requested work"}
+    other = {"role": "user", "content": "concurrent work"}
+    db.append_messages_batch("sess-batch", [other])
+    db.append_messages_batch("sess-batch", [message])
+    assert message["_row_id"] != other["_row_id"]
+    rows = db._conn.execute("SELECT content FROM messages ORDER BY id").fetchall()
+    assert [row[0] for row in rows] == ["concurrent work", "original requested work"]
