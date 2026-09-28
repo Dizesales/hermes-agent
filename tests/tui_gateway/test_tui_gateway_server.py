@@ -11324,6 +11324,124 @@ def test_file_attach_quotes_ref_with_spaces(monkeypatch, tmp_path):
         server._sessions.pop("sid", None)
 
 
+def test_file_attach_workspace_storage_follows_the_owning_profiles_config(monkeypatch, tmp_path):
+    """``attachments.storage: workspace`` is read from the SESSION's profile config.
+
+    Opt-in profiles stage under ``<workspace>/.hermes/attachments`` (inside the
+    allowed ref root, #110662); a profile without the opt-in keeps the
+    bind-mounted ``<profile home>/attachments`` — one serve process, two homes,
+    each session follows its own profile's config.
+    """
+    workspace_a = tmp_path / "work-a"
+    workspace_a.mkdir()
+    home_a = tmp_path / "home-a"
+    home_a.mkdir()
+    (home_a / "config.yaml").write_text("attachments:\n  storage: workspace\n", encoding="utf-8")
+
+    def fake_resolve(raw):
+        return None
+
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = fake_resolve
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    def attach(sid: str, params: dict) -> dict:
+        return server.handle_request(
+            {"id": "1", "method": "file.attach", "params": {"session_id": sid, **params}}
+        )
+
+    try:
+        server._sessions["sid-a"] = _session(cwd=str(workspace_a), profile_home=str(home_a))
+        resp = attach(
+            "sid-a",
+            {
+                "path": "/Users/alice/Downloads/report.txt",
+                "name": "report.txt",
+                "data_url": "data:text/plain;base64,aGVsbG8=",
+            },
+        )
+
+        staged_a = workspace_a / ".hermes" / "attachments" / "report.txt"
+        assert resp["result"]["attached"] is True
+        assert resp["result"]["path"] == str(staged_a)
+        assert staged_a.read_text(encoding="utf-8") == "hello"
+        # Workspace staging lands inside the allowed ref root: the ref is
+        # workspace-relative, not an absolute out-of-workspace path.
+        assert resp["result"]["ref_text"] == "@file:.hermes/attachments/report.txt"
+        assert not (home_a / "attachments").exists()
+
+        # Same serve process, second profile WITHOUT the opt-in: staging stays
+        # on that profile's hermes-home attachments dir.
+        workspace_b = tmp_path / "work-b"
+        workspace_b.mkdir()
+        home_b = tmp_path / "home-b"
+        home_b.mkdir()
+        server._sessions["sid-b"] = _session(cwd=str(workspace_b), profile_home=str(home_b))
+        resp = attach(
+            "sid-b",
+            {
+                "path": "/Users/alice/Downloads/report.txt",
+                "name": "report.txt",
+                "data_url": "data:text/plain;base64,aGVsbG8=",
+            },
+        )
+
+        staged_b = home_b / "attachments" / "report.txt"
+        assert resp["result"]["path"] == str(staged_b)
+        assert staged_b.read_text(encoding="utf-8") == "hello"
+        assert not (workspace_b / ".hermes").exists()
+    finally:
+        server._sessions.pop("sid-a", None)
+        server._sessions.pop("sid-b", None)
+
+
+@pytest.mark.parametrize("ssh_with_local_path", [False, True])
+def test_file_attach_workspace_storage_falls_back_for_non_local_workspace(monkeypatch, tmp_path, ssh_with_local_path):
+    """Workspace storage only applies to a workspace on THIS host.
+
+    A session bound to a remote cwd (ssh profile) can't be written from the
+    gateway; those attachments keep the bind-mounted ``<profile home>/attachments``
+    so container/remote backends still receive them (#76577).
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text("attachments:\n  storage: workspace\n", encoding="utf-8")
+    remote_cwd = str(tmp_path / "remote-host" / "agent-a")  # does not exist here
+    if ssh_with_local_path:
+        Path(remote_cwd).mkdir(parents=True)
+        (home / "config.yaml").write_text("attachments:\n  storage: workspace\nterminal:\n  backend: ssh\n", encoding="utf-8")
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: None
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    server._sessions["sid"] = _session(cwd=remote_cwd, profile_home=str(home))
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "path": "/Users/alice/Downloads/report.txt",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,aGVsbG8=",
+                },
+            }
+        )
+
+        stored = home / "attachments" / "report.txt"
+        assert resp["result"]["attached"] is True
+        assert resp["result"]["path"] == str(stored)
+        assert stored.read_text(encoding="utf-8") == "hello"
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_commands_catalog_surfaces_quick_commands(monkeypatch):
     monkeypatch.setattr(
         server,
@@ -15015,7 +15133,7 @@ def test_session_delete_refuses_active_session(monkeypatch):
     called: list[str] = []
 
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, **_kw):
             called.append(sid)
             return True
 
@@ -15064,7 +15182,7 @@ def test_session_delete_fails_closed_when_active_snapshot_raises(monkeypatch):
 
 def test_session_delete_returns_4007_when_missing(monkeypatch):
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, **_kw):
             return False
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -15079,7 +15197,7 @@ def test_session_delete_returns_4007_when_missing(monkeypatch):
 
 def test_session_delete_propagates_db_exception(monkeypatch):
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, **_kw):
             raise RuntimeError("disk full")
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -15100,7 +15218,7 @@ def test_session_delete_success_returns_deleted_id(monkeypatch):
     captured: dict = {}
 
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, **_kw):
             captured["sid"] = sid
             captured["sessions_dir"] = sessions_dir
             return True
@@ -15327,7 +15445,7 @@ def test_session_delete_honors_params_profile_sessions_dir(monkeypatch, tmp_path
         def __init__(self, db_path=None):
             captured["db_path"] = db_path
 
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, **_kw):
             captured["sid"] = sid
             captured["sessions_dir"] = sessions_dir
             return True
