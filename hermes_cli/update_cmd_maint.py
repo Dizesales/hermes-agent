@@ -892,6 +892,45 @@ def _refresh_cua_driver_after_update() -> None:
         install_cua_driver(upgrade=True, require_confirmed_update=True, show_installer_progress=False)
 
 
+#: Bound for the Browser Use CLI provision inside `hermes update` (well under the
+#: 600s interactive default - an update must not stall on one optional download).
+_BROWSER_USE_CLI_UPDATE_TIMEOUT_S = 180
+
+
+def _ensure_browser_use_cli_after_update() -> None:
+    """Provision the Browser Use CLI when the default backend would silently downgrade.
+
+    The default backend (unset ``browser.backend``) uses the CLI when runnable and
+    falls back to the built-in tools otherwise, so a missing CLI after an update is
+    a silent downgrade. Explicit backends (including ``off``) and Camofox never need
+    it. Bounded and non-fatal: never raises.
+    """
+    try:
+        from tools.lazy_deps import _allow_lazy_installs
+        if not _allow_lazy_installs():
+            return
+        from tools.browser_use_cli import _camofox_active, _find_cli, get_browser_backend
+
+        if get_browser_backend() or _camofox_active() or _find_cli() is not None:
+            return
+    except Exception:
+        return
+    try:
+        from hermes_cli.tools_config_post_setup import _ensure_browser_use_cli
+
+        print("\n→ Installing browser-use CLI (default browser backend)...")
+        _ensure_browser_use_cli(timeout_s=_BROWSER_USE_CLI_UPDATE_TIMEOUT_S)
+    except Exception as exc:  # pragma: no cover - defensive; update must not fail
+        print(f"  ⚠ browser-use CLI was not installed: {exc}")
+        print("    Retry with: hermes tools post-setup browser_use_cli")
+
+
+
+def _install_default_tools_after_update() -> None:
+    """Backport the Browser Use CLI update repair without changing package management."""
+    _ensure_browser_use_cli_after_update()
+
+
 def _print_checkpoint_footprint_notice() -> None:
     """Surface a GB-scale /rollback store the user may not know is on (see the helper's docstring)."""
     from tools.checkpoint_manager import checkpoint_footprint_notice
@@ -930,6 +969,7 @@ def _print_post_update_notices_and_self_heals() -> None:
         ('hermes-acp launcher self-heal failed: %s', _ensure_acp_launcher),
         ('Windows bin launcher migration failed: %s', _migrate_windows_bin_path),
         ('cua-driver refresh failed: %s', _refresh_cua_driver_after_update),
+        ('browser-use CLI provision failed: %s', _install_default_tools_after_update),
         ('Checkpoint footprint notice failed: %s', _print_checkpoint_footprint_notice),
         ('Plugin compat notice failed: %s', _print_plugin_compat_notice),
         # Legacy HERMES_NEMO_RELAY_ATIF_*/ATOF_* vars produce no traces since the Relay cutover;
