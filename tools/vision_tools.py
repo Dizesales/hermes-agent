@@ -247,9 +247,20 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
 
 
 def _image_to_base64_data_url(image_path: Path, mime_type: Optional[str] = None) -> str:
-    """``data:<mime>;base64,...`` for a file (MIME from extension when not given)."""
+    """``data:<mime>;base64,...`` for a file (MIME from extension when not given).
+
+    The declared type must match the bytes: Anthropic rejects a JPEG labelled image/png (HTTP 400),
+    so a recognised raster signature wins over the caller/extension guess."""
+    raw = image_path.read_bytes()
     mime = mime_type or _determine_mime_type(image_path)
-    return f"data:{mime};base64,{base64.b64encode(image_path.read_bytes()).decode('ascii')}"
+    try:
+        from agent.image_routing import _sniff_mime_from_bytes
+        sniffed = _sniff_mime_from_bytes(raw)
+    except Exception:
+        sniffed = None
+    if sniffed and sniffed != mime and sniffed != "image/svg+xml":
+        mime = sniffed
+    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
 
 
 # Absolute hard ceiling for vision payloads (20 MB): no major provider accepts more.
