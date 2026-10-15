@@ -1660,6 +1660,13 @@ def _multiplex_profile_homes(config: object) -> list[tuple[str, Path]]:
     reserved = getattr(config, "_runtime_profile_homes", None)
     if reserved is not None:
         return list(reserved)
+    if getattr(config, "multiplex_profiles", None) is not True:
+        # Dize: one gateway per profile per host. Without a multiplex reservation this process
+        # serves (and ticks cron for) its launch profile only, never sibling profile dirs that
+        # belong to another host's gateway.
+        from hermes_cli.profiles import get_active_profile_name, get_profile_dir
+        active = get_active_profile_name() or "default"
+        return [(active, Path(get_profile_dir(active)))]
     from hermes_cli.profiles import profiles_to_serve
     return list(profiles_to_serve(multiplex=True))
 
