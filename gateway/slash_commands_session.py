@@ -888,24 +888,47 @@ class GatewaySessionCommandsMixin:
         if denied is not None:
             return denied
         current_entry = await self.async_session_store.get_or_create_session(source)
-        if current_entry.session_id == target_id:
+        already_on = current_entry.session_id == target_id
+        if not already_on:
+            self._release_running_agent_state(session_key)
+            new_entry = await self.async_session_store.switch_session(session_key, target_id)
+            if not new_entry:
+                return t("gateway.resume.switch_failed")
+        if not already_on:
+            # Conversation boundary: all conversation-scoped state + security state in one funnel call.
+            # Conversation boundary: clear ALL conversation-scoped per-session state (model/reasoning overrides
+            # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security
+            # state in one funnel call. See _CONVERSATION_SCOPED_STATE in gateway/run.py.
+            self._clear_conversation_scope(session_key, reason="resume")
+            # switch_session keeps the route's persisted /model pin (a re-pin is not a boundary,
+            # #119864); /resume IS one, and the funnel above clears only in-memory state — without this
+            # the next turn's _rehydrate_session_model_override resurrects the pin it just cleared.
+            await self.async_session_store.set_model_override(session_key, None)
+            # Evict so the next turn rebuilds with the right session_id — the cached AIAgent's memory
+            # provider cached _session_id at initialize() and would keep writing to the wrong session.
+            self._evict_cached_agent(session_key)
+        # Only this authorized command promotes historical delegate provenance. Generic
+        # switch_session() is also called by background completions and is NOT authority.
+        # Commit before reporting success; retain _delegate_from for audit/nested children.
+        # If persistence fails, a repeated explicit /resume can finish even when already_on.
+        import json
+        row = await self._session_db.get_session(target_id) or {}
+        config = row.get("model_config") or {}
+        if isinstance(config, str):
+            try:
+                config = json.loads(config)
+            except ValueError:
+                config = {}  # Preserve legacy resume; malformed provenance stays fail-closed.
+        if (isinstance(config, dict) and isinstance(config.get("_delegate_from"), str)
+                and config["_delegate_from"].strip()):
+            await self._session_db.patch_session_model_config(target_id, {
+                "_gateway_resume": {
+                    "session_id": target_id,
+                    "delegate_from": config["_delegate_from"],
+                },
+            })
+        if already_on:
             return t("gateway.resume.already_on", name=name)
-        self._release_running_agent_state(session_key)
-        new_entry = await self.async_session_store.switch_session(session_key, target_id)
-        if not new_entry:
-            return t("gateway.resume.switch_failed")
-        # Conversation boundary: all conversation-scoped state + security state in one funnel call.
-        # Conversation boundary: clear ALL conversation-scoped per-session state (model/reasoning overrides
-        # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security
-        # state in one funnel call. See _CONVERSATION_SCOPED_STATE in gateway/run.py.
-        self._clear_conversation_scope(session_key, reason="resume")
-        # switch_session keeps the route's persisted /model pin (a re-pin is not a boundary,
-        # #119864); /resume IS one, and the funnel above clears only in-memory state — without this
-        # the next turn's _rehydrate_session_model_override resurrects the pin it just cleared.
-        await self.async_session_store.set_model_override(session_key, None)
-        # Evict so the next turn rebuilds with the right session_id — the cached AIAgent's memory
-        # provider cached _session_id at initialize() and would keep writing to the wrong session.
-        self._evict_cached_agent(session_key)
         title = await self._session_db.get_session_title(target_id) or name
         try:
             history = await self.async_session_store.load_transcript(target_id)

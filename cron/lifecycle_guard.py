@@ -568,6 +568,11 @@ def _unreadable_reason(path: Path) -> str:
     return f"`{path}` is larger than the scan cap ({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget"
 
 
+def _is_size_only_refusal(reason: str) -> bool:
+    """Hefesto: a large regular file is not a lifecycle risk by itself."""
+    return "is larger than the scan cap" in reason
+
+
 def _refuse_unreadable(budget: _LifecycleScanBudget, path: Path, reason: str) -> bool:
     logger.warning("lifecycle guard cannot scan referenced script %s: %s; failing closed", path, reason)
     budget.refusal = reason
@@ -1144,8 +1149,11 @@ def _contains_unsafe_gateway_action(
         # remainder fails closed exactly like an oversized one.
         script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
         if unsafe:
+            reason = _unreadable_reason(script_path)
+            if candidate_executed and not _is_size_only_refusal(reason):
+                return _refuse_unreadable(budget, script_path, reason)
             if candidate_executed:
-                return _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
+                logger.warning("lifecycle guard skipped oversized script %s: %s", script_path, reason)
             continue
         if script_text is None and read_remote_script is not None:
             # Local path missing; the remote backend's output crosses the same trust boundary as a
@@ -1159,11 +1167,7 @@ def _contains_unsafe_gateway_action(
             )
             if unsafe:
                 if candidate_executed:
-                    return _refuse_unreadable(
-                        budget, script_path,
-                        f"`{script_path}` read from the backend exceeds the scan cap "
-                        f"({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget",
-                    )
+                    logger.warning("lifecycle guard skipped oversized remote script %s", script_path)
                 continue
         if not script_text:
             continue

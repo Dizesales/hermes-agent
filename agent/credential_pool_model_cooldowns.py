@@ -52,11 +52,22 @@ class CredentialPoolModelCooldownMixin:
         selecting it from the pool (env / borrowed credentials). Tokens the
         pool does not know fail open: no row can attribute a cooldown to them.
         """
+        from agent.credential_pool import STATUS_DEAD, _exhausted_until
+
+        if not token:
+            return False
         with self._lock:
-            return any(
-                entry.runtime_api_key == token and model_cooldown_until(entry, model) is not None
-                for entry in self._entries
-            )
+            now = time.time()
+            sole_credential = self._is_sole_credential()
+            for entry in self._entries:
+                if entry.runtime_api_key != token:
+                    continue
+                if entry.last_status == STATUS_DEAD or model_cooldown_until(entry, model) is not None:
+                    return True
+                until = _exhausted_until(entry, sole_credential=sole_credential)
+                if until is not None and until > now:
+                    return True
+            return False
 
     def _is_model_scoped_failure(
         self, status_code: Optional[int], model: Optional[str], failure_reason: Optional[str],

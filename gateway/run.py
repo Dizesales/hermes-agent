@@ -1128,6 +1128,10 @@ def _build_replay_entry(
     providers.
     """
     entry: Dict[str, Any] = {"role": role, "content": content}
+    # Preserve native summary provenance through gateway replay. The selector
+    # requires this internal flag; a user quoting a summary prefix is not proof.
+    if msg.get("_compressed_summary") is True:
+        entry["_compressed_summary"] = True
     # api_content sidecar keeps the request prefix byte-stable — ONLY if this pipeline did not rewrite
     # content. The caller renders timestamps AFTER this check so a stamp alone never drops the sidecar.
     _sidecar = msg.get("api_content")

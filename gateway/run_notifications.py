@@ -27,6 +27,9 @@ from gateway.run_shutdown import _log_suppressed, _notice_target_key, _send_erro
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Bound corrupt durable delegate provenance; native nesting is smaller.
+_MAX_DELEGATE_PROVENANCE_HOPS = 16
+
 # A failed /update leaves the previous version running; the full pip/git log stays on the host
 # (`hermes update` re-runs it in the terminal) and only a short tail is quoted in chat.
 _UPDATE_FAILED_NOTICE = (
@@ -245,6 +248,90 @@ class GatewayNotificationsMixin:
             return None
         return target_session_id
 
+    async def _completion_provenance(self, session_db, pinned_session_id, pinned_row, *, retry_lookup_errors=False):
+        """Resolve durable delegate ownership without changing the route."""
+        delegate_chain: set[str] = set()
+        for _ in range(_MAX_DELEGATE_PROVENANCE_HOPS + 1):
+            if pinned_session_id in delegate_chain:
+                logger.warning(
+                    "Async-delegation completion has cyclic delegate provenance at session %s; "
+                    "dropping injection (#92611).", pinned_session_id,
+                )
+                return None
+            delegate_chain.add(pinned_session_id)
+            model_config = pinned_row.get("model_config")
+            if isinstance(model_config, str):
+                try:
+                    model_config = json.loads(model_config)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Async-delegation completion has malformed model_config for session %s; "
+                        "dropping injection (#92611).", pinned_session_id,
+                    )
+                    return None
+            if model_config is not None and not isinstance(model_config, dict):
+                logger.warning(
+                    "Async-delegation completion has non-object model_config for session %s; "
+                    "dropping injection (#92611).", pinned_session_id,
+                )
+                return None
+            if not isinstance(model_config, dict):
+                model_config = {}
+            delegate_parent_id = str(model_config.get("_delegate_from") or "").strip()
+            if not delegate_parent_id:
+                break
+            promotion = model_config.get("_gateway_resume")
+            if (isinstance(promotion, dict)
+                    and promotion.get("delegate_from") == model_config.get("_delegate_from")
+                    and isinstance(promotion.get("session_id"), str)
+                    and promotion["session_id"]):
+                promoted_id = promotion["session_id"]
+                if promoted_id == pinned_session_id:
+                    break
+                # Compression copies model_config; an ordinary delegate/branch does not
+                # inherit authority. Verify the native lineage AND its persisted anchor.
+                try:
+                    lineage = await session_db.get_compression_lineage(pinned_session_id)
+                    anchor = (await session_db.get_session(promoted_id)
+                              if promoted_id in lineage and pinned_session_id in lineage
+                              and lineage.index(promoted_id) < lineage.index(pinned_session_id)
+                              else None)
+                except Exception:
+                    if retry_lookup_errors:
+                        raise
+                    return None
+                anchor_config = (anchor or {}).get("model_config") or {}
+                if isinstance(anchor_config, str):
+                    try:
+                        anchor_config = json.loads(anchor_config)
+                    except ValueError:
+                        return None
+                if (isinstance(anchor_config, dict)
+                        and anchor_config.get("_gateway_resume") == promotion
+                        and anchor_config.get("_delegate_from") == model_config.get("_delegate_from")):
+                    break
+            try:
+                delegate_parent_row = await session_db.get_session(delegate_parent_id)
+            except Exception:
+                if retry_lookup_errors:
+                    raise
+                delegate_parent_row = None
+            if delegate_parent_row is None:
+                logger.warning(
+                    "Async-delegation completion has missing delegate parent %s for child %s; "
+                    "dropping injection (#92611).", delegate_parent_id, pinned_session_id,
+                )
+                return None
+            pinned_session_id = delegate_parent_id
+            pinned_row = delegate_parent_row
+        else:
+            logger.warning(
+                "Async-delegation completion exceeded %d delegate provenance hops (last session %s); "
+                "dropping injection (#92611).", _MAX_DELEGATE_PROVENANCE_HOPS, pinned_session_id,
+            )
+            return None
+        return pinned_session_id, pinned_row
+
     async def _resolve_async_delegation_session(
         self, session_entry: SessionEntry, pinned_session_id: str,
     ) -> Optional[SessionEntry]:
@@ -253,6 +340,14 @@ class GatewayNotificationsMixin:
         Follow compression-rotation lineage (parent row ended, child continues), but never let a
         late completion override an unrelated /new or restored route. Unknown ownership fails
         closed; the result stays in the delegation records.
+
+        A pinned *delegate* row is likewise canonicalized to its human-facing parent through
+        ``model_config._delegate_from`` before any route check or mutation (#92611). Unresolvable
+        provenance — a cycle, a missing parent, a malformed config, or a chain longer than
+        ``_MAX_DELEGATE_PROVENANCE_HOPS`` — drops the injection rather than falling back to the
+        current route entry. That is deliberate: routing an internal child's output into a session
+        whose ownership was never verified is the same class of defect this canonicalization fixes,
+        and the completion remains readable in the delegation records either way.
         """
         from gateway.run import _USER_BOUNDARY_END_REASONS
         session_db = cast(Any, self._session_db)
@@ -276,6 +371,19 @@ class GatewayNotificationsMixin:
                 "dropping injection (#55578 fail-closed).", pinned_session_id,
             )
             return None
+        # Delegate rows are execution transcripts, not gateway route owners. A process completion can
+        # be stamped with the child session id even though the human-facing conversation belongs to
+        # `_delegate_from`. Follow that durable provenance before any route verification or mutation;
+        # otherwise switch_session() can end the real parent and rebind the platform chat to an
+        # internal child (#92611).
+        #
+        # Real nesting is bounded by delegation.max_spawn_depth (default 2), so the hop cap only
+        # guards a corrupt/hand-edited chain: without it a single completion event could fan out
+        # into hundreds of sequential get_session() reads before terminating.
+        resolved = await self._completion_provenance(session_db, pinned_session_id, pinned_row)
+        if resolved is None:
+            return None
+        pinned_session_id, pinned_row = resolved
         target_session_id = pinned_session_id
         follows_compression = False
         if pinned_row.get("ended_at"):
@@ -1335,6 +1443,11 @@ class GatewayNotificationsMixin:
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            if evt.get("type") == "async_delegation":
+                metadata["async_delegation_ids"] = list(dict.fromkeys(
+                    str(value) for value in evt.get("_admitted_delegation_ids", [evt.get("delegation_id")])
+                    if value))
+                metadata["async_delegation_interim"] = bool(evt.get("task_failure_notice"))
             synth_event = MessageEvent(
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None, metadata=metadata,
@@ -1423,6 +1536,15 @@ class GatewayNotificationsMixin:
             return "retry"
         if parent is None:
             return "terminal"
+        try:
+            resolved = await self._completion_provenance(
+                session_db, parent_session_id, parent, retry_lookup_errors=True,
+            )
+        except Exception:
+            return "retry"
+        if resolved is None:
+            return "terminal"
+        parent_session_id, parent = resolved
         if not parent.get("ended_at"):
             return "deliver"
         end_reason = str(parent.get("end_reason") or "")
@@ -1599,7 +1721,13 @@ class GatewayNotificationsMixin:
                 if self._completion_identity_seen(identity, claim=True):
                     return None
                 identity_claimed = True
-            injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
+            # Preserve the identities of precisely the claimed siblings carried in this turn.
+            # Metadata is observational: it never changes routing, claim settlement or authority.
+            injection_evt = evt
+            if evt.get("type") == "async_delegation":
+                injection_evt = dict(evt, _admitted_delegation_ids=[
+                    evt.get("delegation_id"), *[sibling.get("delegation_id") for sibling, _ in sibling_claims]])
+            injection_result = await self._inject_watch_notification(synth_text, injection_evt, raise_not_accepted=True)
             if injection_result is _SYNTHETIC_EVENT_NO_ROUTE:
                 unroutable = True
                 return None

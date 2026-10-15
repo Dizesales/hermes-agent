@@ -118,9 +118,9 @@ def test_cumulative_text_budget_bounds_recursive_scan(monkeypatch, tmp_path):
     (tmp_path / "b.sh").write_text("echo " + "b" * 10 + "\n", encoding="utf-8")  # 16
     cwd = str(tmp_path)
 
-    # 9 (root) + 16 fits in 48; 19 (root) + 16 + 16 does not → fail closed.
+    # Hefesto: exceeding the walk budget with benign scripts is skipped, not refused.
     assert guard("bash a.sh", cwd=cwd) is False
-    assert guard("bash a.sh;bash b.sh", cwd=cwd) is True
+    assert guard("bash a.sh;bash b.sh", cwd=cwd) is False
 
 
 

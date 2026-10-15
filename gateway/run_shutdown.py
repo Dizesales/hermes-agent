@@ -173,6 +173,75 @@ class GatewayShutdownMixin:
             return time.monotonic() - self.started_at
 
     # Active-work accounting
+    def _native_delegation_work_snapshot(self) -> list:
+        """Hefesto process overlay: detached work the native stop phase can interrupt.
+
+        Read only already-loaded registries and only metadata, never progress callbacks.
+        A batch and its registered children form one work unit. An unreadable or busy
+        registry contributes one conservative unknown unit; existing drain deadlines
+        still apply. Other process profiles keep upstream accounting unchanged.
+        """
+        from hermes_constants import get_process_hermes_home
+        if get_process_hermes_home() != Path('/root/.hermes/profiles/hefesto'):
+            return []
+
+        units: dict = {}
+        unknown = False
+        sources = (
+            ('tools.async_delegation', '_records', '_records_lock', False),
+            ('tools.delegate_tool_registry', '_active_subagents', '_active_subagents_lock', True),
+        )
+        for module_name, records_name, lock_name, children in sources:
+            module = sys.modules.get(module_name)
+            if module is None:
+                continue
+            lock = None
+            acquired = False
+            try:
+                lock = getattr(module, lock_name)
+                acquired = lock.acquire(blocking=False)
+                if not acquired:
+                    unknown = True
+                    continue
+                records = getattr(module, records_name)
+                if not isinstance(records, dict):
+                    raise TypeError('Invalid native delegation registry')
+                for record_id, record in records.items():
+                    if not isinstance(record_id, str) or not record_id or not isinstance(record, dict):
+                        raise TypeError('Invalid native delegation record')
+                    if children:
+                        delegation_id = record.get('delegation_id')
+                        if delegation_id is not None and not isinstance(delegation_id, str):
+                            raise TypeError('Invalid child delegation identity')
+                        key = ('delegation', delegation_id) if delegation_id else ('subagent', record_id)
+                        unit = units.setdefault(key, {
+                            'kind': key[0], 'state': 'child_running', 'pid': os.getpid(),
+                            ('delegation_id' if delegation_id else 'subagent_id'): key[1],
+                            'child_count': 0,
+                        })
+                        unit['child_count'] += 1
+                    else:
+                        status = record.get('status')
+                        if not isinstance(status, str) or not status:
+                            raise TypeError('Invalid native delegation status')
+                        # Matches async_delegation.active_count, including persistence/queue handoff.
+                        if status in ('running', 'stalling', 'finalizing'):
+                            units[('delegation', record_id)] = {
+                                'kind': 'delegation', 'delegation_id': record_id,
+                                'state': status, 'pid': os.getpid(), 'child_count': 0,
+                            }
+                        elif status not in ('completed', 'error', 'failed', 'interrupted',
+                                            'cancelled', 'canceled', 'stalled'):
+                            unknown = True
+            except Exception:
+                unknown = True
+            finally:
+                if acquired:
+                    lock.release()
+        if unknown:
+            units[('unknown', '')] = {'kind': 'delegation_unknown', 'state': 'unknown', 'pid': os.getpid()}
+        return list(units.values())
+
     def _active_work_count(self) -> int:
         """All agent work the gateway must expose and drain as one total."""
         return (
@@ -180,6 +249,7 @@ class GatewayShutdownMixin:
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
+            + len(self._native_delegation_work_snapshot())
         )
 
     @staticmethod
@@ -784,10 +854,11 @@ class GatewayShutdownMixin:
 
     # Drain / interrupt
     def _drain_work_counts(self) -> tuple:
-        """``(agents, cron, api, deferred)`` — the four sources the drain waits on."""
+        """``(agents, cron, api, deferred, delegations)`` — sources the drain waits on."""
         return (
             self._running_agent_count(), self._active_cron_job_count(),
             self._active_api_run_count(), self._active_deferred_agent_worker_count(),
+            len(self._native_delegation_work_snapshot()),
         )
 
     async def _drain_active_agents(
@@ -806,10 +877,10 @@ class GatewayShutdownMixin:
                 self._update_runtime_status("draining")
                 last_counts, last_status_at = counts, now
 
-        # Cron/API/deferred work lives outside ``_running_agents``; fold it in or it is killed unwarned.
-        _cron0, _api0, _deferred0 = last_counts[1:]
+        # Cron/API/deferred/delegation work lives outside ``_running_agents``.
+        _cron0, _api0, _deferred0, _delegations0 = last_counts[1:]
         _maybe_update_status(force=True)
-        if not self._running_agents and not (_cron0 or _api0 or _deferred0):
+        if not self._running_agents and not (_cron0 or _api0 or _deferred0 or _delegations0):
             return snapshot, False
         # Cron has its own deadline: a chat turn is announced+resumable; a killed cron run is a permanent failure.
         # ``timeout`` (``restart_drain_timeout``) defaults to 0 because interrupting a chat turn is
@@ -823,8 +894,8 @@ class GatewayShutdownMixin:
 
         def _still_draining() -> bool:
             now = loop.time()
-            agents, cron, api, deferred = self._drain_work_counts()
-            return bool(((agents or api or deferred) and now < deadline) or (cron and now < cron_deadline))
+            agents, cron, api, deferred, delegations = self._drain_work_counts()
+            return bool(((agents or api or deferred or delegations) and now < deadline) or (cron and now < cron_deadline))
 
         # Both budgets at 0 = an expired deadline (loop unentered), so timed_out still comes from real state.
         while _still_draining():
@@ -1514,7 +1585,8 @@ class GatewayShutdownMixin:
 
         ``kind`` ∈ ``chat`` (session turn), ``cron`` (job id + external worker pid when the run was
         handed to a restart-safe scope), ``api`` / ``deferred`` (count only — those sources expose
-        no identity). Best-effort: a source that can't be read is omitted, never raises.
+        no identity), plus native delegation metadata for the Hefesto process. The latter includes
+        an unknown unit if its registry cannot be read; legacy sources remain best-effort.
         """
         from gateway.run import _AGENT_PENDING_SENTINEL
         now = time.time()
@@ -1544,6 +1616,7 @@ class GatewayShutdownMixin:
                               "wedged": job["job_id"] in wedged})
         for kind, count in (("api", self._active_api_run_count()), ("deferred", self._active_deferred_agent_worker_count())):
             units.extend({"kind": kind, "pid": os.getpid()} for _ in range(count))
+        units.extend(self._native_delegation_work_snapshot())
         return units
 
     async def _await_active_work_before_restart(self) -> bool:

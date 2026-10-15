@@ -58,7 +58,14 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
         from hermes_cli.lifecycle import has_hook
         from hermes_cli.plugins import get_pre_verify_continue_message
 
-        if _edited and has_hook("pre_verify") and attempt < max_verify_nudges():
+        # Existing plugins may reconcile non-file work (delegation, publication,
+        # or a saved project snapshot). Explicit profile opt-in preserves the
+        # default code-edit gate and the native continuation budget/alternation.
+        _on_stop = False
+        if not _edited:
+            from hermes_cli.config import load_config_readonly
+            _on_stop = (load_config_readonly().get("agent") or {}).get("pre_verify_on_stop") is True
+        if (_edited or _on_stop) and has_hook("pre_verify") and attempt < max_verify_nudges():
             # Posture is fixed for the session — resolve once + cache.
             coding = getattr(agent, "_resolved_is_coding", None)
             if coding is None:

@@ -1028,13 +1028,13 @@ def _load_pool_with_credentials(provider: str, note: str = "") -> Optional[Any]:
     return pool if pool and pool.has_credentials() else None
 
 
-def _select_pool_entry(provider: str) -> Tuple[bool, Optional[Any]]:
+def _select_pool_entry(provider: str, *, model: Optional[str] = None) -> Tuple[bool, Optional[Any]]:
     """Return (pool_exists_for_provider, selected_entry)."""
     pool = _load_pool_with_credentials(provider)
     if pool is None:
         return False, None
     try:
-        return True, pool.select()
+        return True, pool.select(model=model) if model else pool.select()
     except Exception as exc:
         logger.debug("Auxiliary client: could not select pool entry for %s: %s", provider, exc)
         return True, None
@@ -3002,13 +3002,27 @@ def _try_azure_foundry(
     return client, final_model
 
 
-def _try_anthropic(explicit_api_key: Optional[Union[str, Callable[[], str]]] = None) -> Tuple[Optional[Any], Optional[str]]:
+def _anthropic_token_is_blocked(token: Any, model: Optional[str], base_url: str) -> bool:
+    """Check the actual native Anthropic credential, including clients built before its cooldown."""
+    if not isinstance(token, str) or not token or not model:
+        return False
+    # A proxy is a different quota authority, even if it uses Anthropic's wire protocol.
+    if base_url_origin(base_url) != base_url_origin(_ANTHROPIC_DEFAULT_BASE_URL):
+        return False
+    pool = _load_pool_with_credentials("anthropic")
+    return bool(pool and pool.token_is_blocked(token, model=model))
+
+
+def _try_anthropic(
+    explicit_api_key: Optional[Union[str, Callable[[], str]]] = None, *, model: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
     try:
         from agent.anthropic_adapter import build_anthropic_client
         from agent.anthropic_credentials import resolve_anthropic_token
     except ImportError:
         return None, None
-    pool_present, entry = _select_pool_entry("anthropic")
+    model = model or _get_aux_model_for_provider("anthropic") or "claude-haiku-4-5-20251001"
+    pool_present, entry = _select_pool_entry("anthropic", model=model)
     if pool_present and entry is not None:
         token = explicit_api_key or _pool_runtime_api_key(entry)
     else:
@@ -3032,7 +3046,8 @@ def _try_anthropic(explicit_api_key: Optional[Union[str, Callable[[], str]]] = N
                     base_url = cfg_base_url
     from agent.anthropic_credentials import _is_oauth_token
     is_oauth = _is_oauth_token(token)
-    model = _get_aux_model_for_provider("anthropic") or "claude-haiku-4-5-20251001"
+    if _anthropic_token_is_blocked(token, model, base_url):
+        return None, None
     if _aux_probe_active():
         # Probe: token + adapter import resolved; skip real client construction.
         return _AuxProbeClientStub(api_key="", base_url=base_url), model
@@ -3660,7 +3675,8 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
     status_code = getattr(exc, "status_code", None)
 
     def _rotate(fallback_status: int) -> bool:
-        error_context: Dict[str, Any] = {"message": str(exc)}
+        from agent.agent_runtime_helpers import extract_api_error_context
+        error_context = extract_api_error_context(exc)
         if status_code is not None:
             error_context["status_code"] = status_code
         next_entry = pool.mark_exhausted_and_rotate(
@@ -4370,14 +4386,25 @@ def _try_configured_fallback_chain(
 
 
 def _try_configured_fallback_for_unavailable_client(
-    task: Optional[str], failed_provider: str
+    task: Optional[str], failed_provider: str, *, failed_model: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
-    """Task fallback_chain when an explicit aux provider cannot build a client (no key/OAuth/pool creds);
-    stops at the per-task chain — the main-agent model stays the runtime last resort."""
+    """Use the task fallback chain; a known quota deadline also permits the main fallback chain."""
     explicit = (failed_provider or "").strip().lower()
     if not task or not explicit or explicit in {"auto"}:
         return None, None, ""
-    return _try_configured_fallback_chain(task, explicit, reason="provider unavailable")
+    result = _try_configured_fallback_chain(task, explicit, reason="provider unavailable")
+    if result[0] is not None:
+        return result
+    # A configured but quota-blocked Anthropic account is not a missing login.
+    # Use the same declared provider fallback as a refused in-flight request.
+    if explicit == "anthropic":
+        pool = _load_pool_with_credentials(explicit)
+        next_at = pool.next_available_at(model=failed_model) if pool is not None else None
+        if next_at is not None and next_at > time.time():
+            return _try_main_fallback_chain(
+                task, explicit, reason="credential cooldown", failed_model=failed_model,
+            )
+    return result
 
 
 def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
@@ -4900,6 +4927,11 @@ def _profile_declared_messages_wire(provider: str) -> Optional[str]:
 
 def _route_client(req: _ResolveRequest, client_obj: Any, final_model_str: Optional[str]) -> _ResolveResult:
     """Return (client, model), converting to the async wrapper when ``req.async_mode``."""
+    if _anthropic_token_is_blocked(
+        getattr(client_obj, "api_key", None), final_model_str,
+        str(getattr(client_obj, "base_url", "") or ""),
+    ):
+        return None, None
     if req.async_mode:
         return _to_async_client(client_obj, final_model_str, is_vision=req.is_vision)
     return client_obj, final_model_str
@@ -5200,7 +5232,7 @@ def _resolve_api_key_branch(req: _ResolveRequest, pconfig: Any, resolve_creds: C
     """PROVIDER_REGISTRY ``api_key`` providers (Anthropic via its own resolver), honouring explicit overrides."""
     provider = req.provider
     if provider == "anthropic":
-        client, default_model = _try_anthropic(explicit_api_key=req.explicit_api_key)
+        client, default_model = _try_anthropic(explicit_api_key=req.explicit_api_key, model=req.model)
         return _route_or_warn(req, client, default_model,
                               "resolve_provider_client: anthropic requested but no Anthropic credentials found")
     creds = resolve_creds(provider)
@@ -5481,7 +5513,7 @@ _STRICT_VISION_BACKENDS: Dict[str, Callable[[Optional[str]], Tuple[Optional[Any]
     "openrouter": lambda model: _try_openrouter(model=model),
     "nous": lambda model: resolve_provider_client("nous", model, is_vision=True),
     "openai-codex": lambda model: resolve_provider_client("openai-codex", model, is_vision=True),
-    "anthropic": lambda model: _try_anthropic(),
+    "anthropic": lambda model: _try_anthropic(model=model),
     "deepinfra": _deepinfra_strict_vision_backend,
     "custom": lambda model: _try_custom_endpoint(),
 }
@@ -5936,17 +5968,24 @@ def _get_cached_client(
         main_runtime=main_runtime, is_vision=is_vision, task=task, model=model,
     )
     with _client_cache_lock:
-        if cache_key in _client_cache:
-            cached_client, cached_default, cached_loop = _client_cache[cache_key]
-            loop_ok = not async_mode or (
-                cached_loop is not None and cached_loop is current_loop and not cached_loop.is_closed()
-            )
-            if loop_ok:
-                return cached_client, _compat_model(cached_client, model, cached_default)
-            # Stale async entry — evict. Only a closed owner loop may be awaited here; a live
-            # foreign loop stays force-neutered.
+        cached_entry = _client_cache.get(cache_key)
+    if cached_entry is not None:
+        cached_client, cached_default, cached_loop = cached_entry
+        cached_model = _compat_model(cached_client, model, cached_default)
+        loop_ok = not async_mode or (
+            cached_loop is not None and cached_loop is current_loop and not cached_loop.is_closed()
+        )
+        if loop_ok and not _anthropic_token_is_blocked(
+            getattr(cached_client, "api_key", None), cached_model,
+            str(getattr(cached_client, "base_url", "") or ""),
+        ):
+            return cached_client, cached_model
+        with _client_cache_lock:
+            if _client_cache.get(cache_key) is cached_entry:
+                del _client_cache[cache_key]
+        # Cooldown eviction must not close a transport another caller is still using.
+        if not loop_ok:
             _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
-            del _client_cache[cache_key]
     # Build outside the lock. For pool-backed providers derive the key from the pool entry:
     # resolve_api_key_provider_credentials prefers env vars, which would bypass pool rotation
     # and retry an exhausted key.
@@ -7216,7 +7255,7 @@ def _resolve_call_client(
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit)
+                    task, _explicit, failed_model=resolved_model)
                 if fb_client is None:
                     nous_detail = nous_credential_failure_detail() if _explicit == "nous" else None
                     raise AuxiliaryClientUnavailable(
@@ -7559,7 +7598,11 @@ def _ladder_credential_rungs(
         recovery_err = first_err
         # Skip the extra retry for clear payment/quota errors — the endpoint won't accept
         # another request with the same exhausted key.
-        if _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
+        from agent.agent_runtime_helpers import extract_api_error_context
+        from agent.credential_pool import _parse_absolute_timestamp
+        reset_at = _parse_absolute_timestamp(extract_api_error_context(first_err).get("reset_at"))
+        if (_is_rate_limit_error(first_err) and not _is_payment_error(first_err)
+                and not (reset_at is not None and reset_at > time.time())):
             resp, recovery_err = yield from _rung(
                 _LadderStep("call", (client, kwargs)), _credential_rung_accepts)
             if recovery_err is None:
@@ -7585,6 +7628,7 @@ def _ladder_credential_rungs(
 def _next_fallback_after_quarantine(
     task: Optional[str], resolved_provider: str, is_auto: bool, route: _LadderRoute,
     failed_model: Optional[str], failure_scope: Any, *, task_chain_only: bool = False,
+    allow_main_chain: bool = False,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Next candidate after a fallback entry was quarantined mid-request (dead credential or a
     capacity error): remaining configured entries (task chain, then main chain on auto) before the
@@ -7596,7 +7640,7 @@ def _next_fallback_after_quarantine(
         failed_base_url=route.base_info, failure_scope=failure_scope)
     if task_chain_only:
         return fb
-    if fb[0] is None and is_auto:
+    if fb[0] is None and (is_auto or allow_main_chain):
         fb = _try_main_fallback_chain(
             task, resolved_provider or "auto", reason=reason, failed_model=failed_model,
             failed_base_url=route.base_info, failure_scope=failure_scope)
@@ -7658,9 +7702,19 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
         if reason == "payment error" and _custom_health_base_url(resolved_provider, route.base_info)
         else None
     )
+    anthropic_cooldown = (
+        resolved_provider == "anthropic" and _is_rate_limit_error(first_err)
+        and _anthropic_token_is_blocked(
+            getattr(route.client, "api_key", None), route.final_model, route.base_info,
+        )
+    )
     fb_client, fb_model, fb_label = _try_configured_fallback_chain(
         task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
         failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
+    if fb_client is None and anthropic_cooldown:
+        fb_client, fb_model, fb_label = _try_main_fallback_chain(
+            task, resolved_provider, reason=reason, failed_model=_chain_failed_model,
+            failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
     if fb_client is None and is_auto:
         fb_client, fb_model, fb_label = _try_main_fallback_chain(
             task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
@@ -7690,7 +7744,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
             return fb_resp
         fb_client, fb_model, fb_label = _next_fallback_after_quarantine(
             task, resolved_provider, is_auto, route, _chain_failed_model, _chain_failure_scope,
-            task_chain_only=explicit_auth_with_task_chain)
+            task_chain_only=explicit_auth_with_task_chain, allow_main_chain=anthropic_cooldown)
     # All fallback layers exhausted — one user-visible warning, then re-raise.
     logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted "
                    # All fallback layers exhausted — emit a single user-visible warning so the operator

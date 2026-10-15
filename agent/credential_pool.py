@@ -1175,6 +1175,15 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         failure_reason: Optional[str] = None,
     ) -> PooledCredential:
         normalized_error = _normalize_error_context(error_context)
+        previous_reset = _parse_absolute_timestamp(entry.last_error_reset_at)
+        if (
+            status_code == 429 and entry.last_status == STATUS_EXHAUSTED
+            and entry.last_error_code == 429 and "reset_at" not in normalized_error
+            and previous_reset is not None and previous_reset > time.time()
+            and self._reset_cleared_after(entry) is None
+        ):
+            # A retry without reset metadata is not evidence that the known quota window ended.
+            normalized_error["reset_at"] = previous_reset
         # Permanent OAuth failures become STATUS_DEAD, not STATUS_EXHAUSTED:
         # otherwise a revoked credential re-enters rotation every hour and
         # fails immediately until the user removes it (#32849).

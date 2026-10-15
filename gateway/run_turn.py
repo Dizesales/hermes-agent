@@ -398,6 +398,29 @@ class GatewayTurnMixin:
         except Exception:
             return False
 
+    @staticmethod
+    def _event_observer_context(event, source, session_key):
+        """Trusted event identity for observers; never derive it from message text.
+
+        External messages have no internal correlation metadata. Only the small
+        allowlist travels to the turn, outside the prompt, and queued turns build
+        their own context instead of inheriting the previous event.
+        """
+        if not bool(getattr(event, "internal", False)):
+            return {}
+        from copy import deepcopy
+        metadata = getattr(event, "metadata", None) or {}
+        names = ("dize_delegation", "async_delegation_ids",
+                 "async_delegation_interim", "gateway_session_id")
+        selected = {name: deepcopy(metadata[name]) for name in names if name in metadata}
+        if not selected:
+            return {}
+        platform = getattr(source.platform, "value", source.platform)
+        return {"internal": True, "session_key": session_key,
+                "source": {"platform": str(platform), "chat_id": str(source.chat_id or ""),
+                           "thread_id": str(source.thread_id or ""), "user_id": str(source.user_id or "")},
+                "metadata": selected}
+
     async def _hmwa_resolve_session(self, event, source):
         """Resolve ``source`` to its session entry (topic recovery, internal-route guards, Telegram
         topic-binding heal). Returns ``(source, session_entry, session_key)`` or ``None`` to drop
@@ -2201,6 +2224,7 @@ class GatewayTurnMixin:
                     "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                gateway_event_context=self._event_observer_context(event, source, session_key),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -3901,6 +3925,8 @@ class GatewayTurnMixin:
                 persist_user_message=next_persist_message,
                 persist_user_display_kind=next_display_kind,
                 persist_user_display_metadata=diagnostic_metadata(pending_event) or None,
+                gateway_event_context=self._event_observer_context(
+                    pending_event, next_source, next_session_key) if pending_event is not None else {},
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -4224,6 +4250,7 @@ class GatewayTurnMixin:
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
         scheduled_heartbeat: bool = False,
+        gateway_event_context: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4261,6 +4288,7 @@ class GatewayTurnMixin:
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
             scheduled_heartbeat=scheduled_heartbeat,
+            gateway_event_context=gateway_event_context,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,

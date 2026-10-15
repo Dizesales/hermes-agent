@@ -938,6 +938,17 @@ def _merge_disk_cooldown_state(
         if mem_access and disk_access and mem_access != disk_access:
             return entry
         disk_ts = _parse_absolute_timestamp(disk_entry.get("last_status_at")) or 0.0
+        disk_reset = _parse_absolute_timestamp(disk_entry.get("last_error_reset_at"))
+        mem_cleared = _parse_absolute_timestamp(entry.get("status_cleared_at")) or 0.0
+        if (
+            disk_status == STATUS_EXHAUSTED and entry.get("last_status") == STATUS_EXHAUSTED
+            and disk_entry.get("last_error_code") == 429 and entry.get("last_error_code") == 429
+            and _parse_absolute_timestamp(entry.get("last_error_reset_at")) is None
+            and disk_reset is not None and disk_reset > time.time() and mem_cleared <= disk_ts
+        ):
+            # A stale instance can report a newer 429 without the provider deadline. Keep
+            # that observation, but do not let its missing metadata shorten the quota window.
+            merged = {**merged, "last_error_reset_at": disk_reset}
         if disk_ts <= mem_ts:
             return merged
         if disk_status == STATUS_EXHAUSTED:

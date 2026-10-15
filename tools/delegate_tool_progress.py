@@ -87,9 +87,12 @@ def format_subagent_failure_line(
     line = f"⚠️ Subagent failed{goal_part}"
     if elapsed:
         line += f" after {elapsed}"
-    reason = describe_subagent_failure(failure_reason, error)
+    reason = describe_subagent_failure(getattr(failure_reason, "value", failure_reason), error)
     if reason:
         line += f": {reason.rstrip('.')}"
+    if getattr(failure_reason, "value", failure_reason) == "content_policy_blocked":
+        return line + (". Details: /agents. This attempt ended with a provider refusal; "
+                       "preserve any partial work for review without retrying to bypass it.")
     return line + ". Details: /agents, or ask me to retry with a smaller task."
 
 

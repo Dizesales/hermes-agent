@@ -1246,6 +1246,8 @@ class TurnRunner:
         baked into the cached agent."""
         ctx = self._ctx
         runner = self._runner
+        # Rebind even to empty on reuse; a human follow-up must not inherit an old internal ID.
+        agent._gateway_event_context = dict(getattr(ctx, "gateway_event_context", None) or {})
         agent._notification_config = ctx.user_config
         agent._notification_platform = ctx.source.platform
         # ALWAYS attached (never gated to None): its body gates each event class, and subagent-
