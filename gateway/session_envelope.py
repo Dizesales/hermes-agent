@@ -27,6 +27,12 @@ _WHATSAPP_METADATA = frozenset({'whatsapp_native_type', 'whatsapp_native', 'what
 _WHATSAPP_NATIVE_KEYS = frozenset({'video', 'audio', 'sticker', 'location', 'contact', 'contacts',
                                    'reaction', 'poll', 'pollUpdate'})
 _WHATSAPP_NATIVE_MAX_BYTES = 16 * 1024
+# Dize: the Hefesto execution-control plugin stamps Telegram media references on the inbound event
+# before admission (document/photo/album file refs, the photo-burst batch key, recovered documents);
+# its turn reads them back, so they cross native admission as plain JSON under a closed key set.
+_DIZE_TELEGRAM_METADATA = frozenset({'hefesto_telegram_document', 'hefesto_telegram_media',
+                                     'hefesto_native_batch', 'hefesto_recover_documents'})
+_DIZE_TELEGRAM_METADATA_MAX_BYTES = 64 * 1024
 
 
 def _native_metadata(event):
@@ -35,6 +41,13 @@ def _native_metadata(event):
     metadata = event.metadata
     if not metadata:
         return {}
+    if (isinstance(metadata, dict) and event.source.platform.value == 'telegram'
+            and set(metadata) <= _DIZE_TELEGRAM_METADATA):
+        try:
+            encoded = json.dumps(metadata, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError):
+            return None
+        return json.loads(encoded) if len(encoded.encode()) <= _DIZE_TELEGRAM_METADATA_MAX_BYTES else None
     if (not isinstance(metadata, dict) or event.source.platform.value != 'whatsapp'
             or not set(metadata) <= _WHATSAPP_METADATA):
         return None
