@@ -137,7 +137,11 @@ def digest(secret: bytes, value: str, length: int = 24) -> str:
 
 def gateway_session_id(raw_key: str) -> str:
     """Mirror Hermes' gateway-session sanitization without disclosing the key."""
-    from plugins.memory.honcho.client import HonchoClientConfig
+    # Honcho left core in v0.22: resolve the installed copy (HERMES_HOME/plugins/honcho) through
+    # Hermes's own provider loader instead of the old bundled import path.
+    from plugins.memory import import_provider_module
+
+    HonchoClientConfig = import_provider_module("honcho", "client").HonchoClientConfig
 
     sanitized = re.sub(r"[^a-zA-Z0-9_-]+", "-", raw_key).strip("-")
     if not sanitized:

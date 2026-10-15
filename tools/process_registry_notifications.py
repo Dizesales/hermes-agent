@@ -4,6 +4,8 @@ watch_match, watch_disabled, watch_overflow_*, async_delegation) into the
 TUI inject into the agent conversation."""
 
 import time
+import json
+from pathlib import PurePosixPath, PureWindowsPath
 from dataclasses import dataclass
 from contextlib import suppress
 
@@ -52,6 +54,23 @@ def group_process_notifications(notifications):
 
 
 
+def is_child_process_notification(evt: dict) -> bool:
+    """Raw child process noise, not a delegation or work-closeout deliverable."""
+    if evt.get("type") in {"async_delegation", "async_delegation_work_closeout"}:
+        return False
+    return str(evt.get("owner_task_id") or evt.get("task_id") or "").startswith("sa-")
+
+
+def should_surface_notification(evt: dict, *, surface_child: bool | None = None) -> bool:
+    """Shared policy; callers must first enter the event's owning profile scope."""
+    if not is_child_process_notification(evt):
+        return True
+    if surface_child is None:
+        from tools.process_registry import ProcessRegistry
+        surface_child = ProcessRegistry._surface_child_process_notifications()
+    return surface_child
+
+
 def _format_age(seconds: float) -> str:
     """Human-friendly elapsed string ('18m', '2h3m', '45s')."""
     try:
@@ -67,7 +86,7 @@ def _format_age(seconds: float) -> str:
     return f"{h}h" + (f"{m}m" if m else "")
 
 
-def _model_not_found_patterns() -> "list[str]":
+def _model_not_found_patterns() -> list[str]:
     """Model-not-found phrases from ``agent.error_classifier`` (the failover path's
     own list, so nothing drifts); a minimal built-in set if the import fails.
 
@@ -103,7 +122,7 @@ def _delegation_model_not_found(results, config) -> bool:
     return any(model in text and any(p in text for p in patterns) for text in texts)
 
 
-def _delegation_model_not_found_notice(results) -> "list[str] | None":
+def _delegation_model_not_found_notice(results) -> list[str] | None:
     """Config-level model_not_found notice lines, or None (fail-open) — once per batch."""
     config = _delegation_config()
     if not _delegation_model_not_found(results, config):
@@ -133,13 +152,13 @@ def _is_truncated(entry: dict) -> bool:
     return bool(entry.get("truncated") or entry.get("exit_reason") == "max_iterations")
 
 
-def _notice_lines(results) -> "list[str]":
+def _notice_lines(results) -> list[str]:
     """Blank + model_not_found notice block, or [] when the notice does not apply."""
     notice = _delegation_model_not_found_notice(results)
     return ["", *notice] if notice else []
 
 
-def _preamble(evt: dict, title: str, intro: str, completed_at: float, *, with_goal: bool) -> "list[str]":
+def _preamble(evt: dict, title: str, intro: str, completed_at: float, *, with_goal: bool) -> list[str]:
     """Shared preamble: title, intro, blank, dispatch time, [goal], context/toolsets, role+model."""
     lines = [title, intro, ""]
     dispatched_at = evt.get("dispatched_at")
@@ -156,6 +175,74 @@ def _preamble(evt: dict, title: str, intro: str, completed_at: float, *, with_go
     return lines
 
 
+def _artifact_pointer_lines(result: dict) -> list[str]:
+    """Project successful native write targets already in the durable child trace.
+
+    This is metadata, never an access grant or a filesystem inventory. Do not
+    parse a summary, command, patch body or tool output to invent missing paths.
+    The trace sanitizer truncates targets at 1024 characters; that boundary is
+    ambiguous and cannot be offered as an exact path.
+    """
+    trace = result.get("tool_trace")
+    paths, seen, omitted = [], set(), False
+    for item in trace if isinstance(trace, list) else []:
+        if not isinstance(item, dict) or item.get("tool") not in {"write_file", "patch"}:
+            continue
+        if item.get("status") != "ok":
+            continue
+        summary = item.get("input_summary")
+        targets = summary.get("targets") if isinstance(summary, dict) else None
+        path = targets.get("path") if isinstance(targets, dict) else None
+        if (not isinstance(path, str) or not path or len(path) >= 1024
+                or not path.isprintable() or any(c in path for c in (chr(96), "$"))
+                or "://" in path):
+            omitted = True
+            continue
+        pure = PureWindowsPath(path) if "\\" in path or (len(path) > 1 and path[1] == ":") else PurePosixPath(path)
+        # Keep the exact spelling. Relative paths have no captured cwd; traversal
+        # and non-canonical separators cannot be repaired safely by a renderer.
+        parts = path.replace("\\", "/").split("/")
+        if not pure.is_absolute() or any(part in {".", ".."} for part in parts) or str(pure) != path:
+            omitted = True
+            continue
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
+    if not paths and not omitted:
+        return []
+    lines = [
+        "Native file-write targets from successful tool receipts "
+        "(may be partial; not task acceptance or access grants):",
+        *(f"- {json.dumps(path, ensure_ascii=False)}" for path in paths),
+        "Read only through the current project's authorized tools. These pointers do not grant access "
+        "to profile caches, other projects or arbitrary run directories; file contents/existence are not verified here.",
+    ]
+    if omitted:
+        lines.append("Some successful writes have no safe exact path in the captured trace "
+                     "(for example a relative/truncated path or patch body); this is not proof their files are absent.")
+    return lines
+
+
+def _event_snapshot_lines(evt: dict) -> list[str]:
+    """Label the producer's timestamp without inventing consumption or liveness."""
+    timestamp = evt.get("completed_at")
+    if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
+        return ["Event snapshot time unavailable; this notice does not establish current fan-out liveness."]
+    try:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(timestamp))
+    except (OverflowError, ValueError, OSError):
+        return ["Event snapshot time unavailable; this notice does not establish current fan-out liveness."]
+    return [f"Event snapshot time: {stamp}. Delivery may be delayed; this is not the parent's consumption time "
+            "or proof of current fan-out liveness."]
+
+
+def _terminal_failure_lines(result: dict) -> list[str]:
+    if result.get("failure_reason") == "content_policy_blocked":
+        return ["Failure reason: content_policy_blocked (terminal for this attempt). Preserve partial evidence; "
+                "do not retry or re-dispatch this request to bypass the provider refusal."]
+    return []
+
+
 def _format_task_failure_notice(evt: dict, deleg_id: str) -> str:
     """One child of a still-running fan-out failed: say which, why, and that the batch goes on."""
     (r,) = (evt.get("results") or [{}])[:1] or [{}]
@@ -164,18 +251,20 @@ def _format_task_failure_notice(evt: dict, deleg_id: str) -> str:
     err = str(r.get("error") or "").strip().replace("\n", " ")[:400]
     lines = [
         f"[ASYNC DELEGATION TASK FAILED — {deleg_id}, task {idx + 1}/{n}]",
-        "One subagent in a background fan-out you dispatched has failed while its siblings are still running. "
-        "The batch's consolidated results will still arrive when the last sibling finishes; this is an early "
-        "warning so you can re-dispatch or investigate now instead of then.",
+        "At this event's snapshot, one subagent in your background fan-out had failed while siblings were "
+        "still running. This notice can be delivered later; it is not a current sibling-status report. "
+        "The batch's consolidated results arrive separately. Preserve completed work and inspect the result "
+        "before deciding any authorized continuation.",
         f"Task: {goal}" if goal else "",
         f"Status: {r.get('status', '?')}   Duration: {r.get('duration_seconds', '?')}s" + (f"\nError: {err}" if err else ""),
     ]
+    lines += _event_snapshot_lines(evt) + _terminal_failure_lines(r) + _artifact_pointer_lines(r)
     if r.get("live_transcript"):
         lines.append(f"Live transcript: {r['live_transcript']}")
     return "\n".join(line for line in lines if line)
 
 
-def _recovery_lines(evt: dict) -> "list[str]":
+def _recovery_lines(evt: dict) -> list[str]:
     """Owner-died recovery diagnostics (``recover_abandoned_delegations``): last persisted
     status, per-task transcript paths, their verbatim tails and the owner's git state."""
     if not evt.get("last_known_status"):
@@ -204,11 +293,11 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
         f"A background fan-out unit you dispatched earlier — {unit} — has finished; its consolidated results are "
         "below. Any other units from the same delegate_task call report separately as they finish. You may have "
-        "moved on since dispatching — act on these or re-dispatch if things have changed. If you are still waiting "
+        "moved on since dispatching — reconcile these with your current request and verified effects. If you are still waiting "
         "on siblings, end your turn after acting on this one.",
         completed_at, with_goal=False)
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
-    lines += _recovery_lines(evt)
+    lines += _event_snapshot_lines(evt) + _recovery_lines(evt)
     if evt.get("error") and not results:
         lines += ["--- ERROR ---", f"The batch did not complete successfully: {evt['error']}"]
         return "\n".join(lines)
@@ -237,7 +326,7 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
             lines.append(f"(no summary — status={r_status}" + (f": {r_error}" if r_error else "") + ")")
         if r.get("live_transcript"):
             lines.append(f"Full live transcript (complete tool/assistant trace): {r['live_transcript']}")
-        lines += _process_accounting_lines(r)
+        lines += _terminal_failure_lines(r) + _artifact_pointer_lines(r) + _process_accounting_lines(r)
     return "\n".join(lines)
 
 
@@ -276,8 +365,8 @@ def _format_async_delegation(evt: dict) -> str:
         evt,
         f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
         "A background subagent you dispatched earlier has finished. You may "
-        "have moved on since dispatching it; the full task source is below so "
-        "you can act on the result or re-dispatch if things have changed.",
+        "have moved on since dispatching it; reconcile the result and full task source below "
+        "with your current request and verified effects before continuing.",
         completed_at, with_goal=True)
     lines += _notice_lines([evt]) + [
         f"Status: {status}   API calls: {evt.get('api_calls', 0)}   Duration: {evt.get('duration_seconds', '?')}s"
@@ -296,6 +385,7 @@ def _format_async_delegation(evt: dict) -> str:
             lines += _recovery_lines(evt)
         if summary:
             lines += ["Partial output:", summary]
+    lines += _event_snapshot_lines(evt) + _terminal_failure_lines(evt) + _artifact_pointer_lines(evt)
     return "\n".join(lines)
 
 
@@ -349,6 +439,16 @@ def process_completion_display_text(events: list) -> str:
     return f"Background Process {outcome}{detail}: {cmd}" if cmd else f"Background Process {outcome}{detail}"
 
 
+HEARTBEAT_DISPLAY_KIND = "hidden"  # a wake, not a message: no surface paints the row
+
+
+def heartbeat_display_text(evt: dict) -> str:
+    """One-line CLI receipt for a heartbeat wake; the row itself is hidden (``HEARTBEAT_DISPLAY_KIND``)."""
+    cmd = _short_command(evt.get("command"))
+    age = _format_age(float(evt.get("elapsed") or 0))
+    return f"Background Process Output after {age}: {cmd}" if cmd else f"Background Process Output after {age}"
+
+
 class TimelineNotification(str):
     """Queued model text that stays string-compatible, plus the display kind and compact human
     title the surface paints instead of the raw notification wall."""
@@ -371,7 +471,7 @@ class TimelineNotification(str):
                    "diagnostic" if diagnostic_process_event(event) else "result")
 
 
-def _delegation_attribution_line(evt: dict) -> "str | None":
+def _delegation_attribution_line(evt: dict) -> str | None:
     """One-line provenance for a subagent-owned process event, else None. Such a process
     outlives the child and lands in the PARENT conversation, which would otherwise see an
     anonymous output wall. Keyed on ``owner_task_id`` — ``task_id`` may be the session key."""
@@ -398,7 +498,7 @@ def _completion_status(evt: dict) -> str:
     return _REASON_STATUS.get(reason) or ("completed normally" if evt.get("exit_code", "?") == 0 else "exited")
 
 
-def format_process_notification(evt: dict) -> "str | None":
+def format_process_notification(evt: dict) -> str | None:
     """Format a completion_queue event into an ``[IMPORTANT: ...]`` message."""
     evt_type = evt.get("type", "completion")
     # watch_disabled and overflow events carry their own human-readable `message`;
@@ -414,12 +514,11 @@ def format_process_notification(evt: dict) -> "str | None":
         _attribution = f"Handed off to you by a subagent before it finished. Purpose: {evt['handoff_note']}"
     attribution = f"{_attribution}\n" if _attribution else ""
     if evt_type == "heartbeat":
-        _out = evt.get("output") or "(no new output since the last heartbeat)"
         return (
             f"[Background process {_sid} heartbeat #{evt.get('seq', '?')} — still running after "
-            f"{_format_age(float(evt.get('elapsed') or 0))} (next in {evt.get('interval', '?')}s; "
-            f"you will also be told when it exits).\n"
-            f"{attribution}Command: {_cmd}\nOutput since last heartbeat:\n{_out}]")
+            f"{_format_age(float(evt.get('elapsed') or 0))} (next in {evt.get('interval', '?')}s when there "
+            f"is new output; you will also be told when it exits).\n"
+            f"{attribution}Command: {_cmd}\nOutput since last heartbeat:\n{evt.get('output', '')}]")
     if evt_type == "watch_match":
         _sup = evt.get("suppressed", 0)
         return (

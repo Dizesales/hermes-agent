@@ -501,7 +501,7 @@ def test_index_guard_rejects_stale_or_incomplete_evidence(tmp_path, change):
         m.check_index(policy, receipts)
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 @pytest.mark.parametrize("publication_status", ["SYNCED", "NO_CHANGE"])
 def test_publication_only_queues_on_protected_change(tmp_path, monkeypatch, publication_status):
     m, source, _, policy, receipts = _indexed_fixture(tmp_path)

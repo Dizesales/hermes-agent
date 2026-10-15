@@ -506,9 +506,12 @@ def test_async_delegation_event_from_child_never_suppressed(monkeypatch):
             "goal": "port the widget",
             "status": "completed",
             "summary": "Widget ported successfully.",
+            # Dize: async-delegation events always need ownership proof (an unfiltered drain
+            # never consumes them), so the parent drains with its session_key.
+            "session_key": "parent-sk",
         }
     )
-    results = reg.drain_notifications()
+    results = reg.drain_notifications(session_key="parent-sk")
     assert len(results) == 1
     evt, text = results[0]
     assert evt["type"] == "async_delegation"

@@ -455,7 +455,7 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
     new_def = {"type": "function", "function": {"name": "mcp_x_tool", "description": "", "parameters": {}}}
 
     import model_tools
-    import tools.mcp_tool  # noqa: F401 — the prologue's import-cost gate requires it in sys.modules
+    import tools.mcp_tool
     with patch("tools.mcp_tool_discovery.has_registered_mcp_tools", return_value=True), \
          patch.object(model_tools, "get_tool_definitions", return_value=[new_def]):
         _build(agent)
@@ -506,6 +506,29 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     assert not _title_turn(platform).called
 
 
+def test_prologue_names_a_subagent_run_after_its_goal_without_a_model_call():
+    """A delegate run gets ``Subagent: <goal>`` at derived authority so it reads as machinery
+    wherever ``sessions.show_subagents`` lists it, instead of staying untitled (#97202)."""
+    from agent import turn_context
+
+    agent = _TitlingAgent("subagent")
+    agent._session_db.set_auto_title.return_value = True
+    with patch("agent.title_generator.maybe_auto_title") as titler:
+        turn_context._maybe_title_session_at_turn_start(
+            agent, [{"role": "user", "content": "Audit the billing module\n\nContext: ..."}])
+    assert not titler.called
+    agent._session_db.set_auto_title.assert_called_once_with(
+        "sess-1", "Subagent: Audit the billing module", source="derived")
+
+
+def test_prologue_leaves_cron_runs_untitled():
+    agent = _TitlingAgent("cron")
+    from agent import turn_context
+
+    turn_context._maybe_title_session_at_turn_start(agent, [{"role": "user", "content": "Run the job"}])
+    assert not agent._session_db.set_auto_title.called
+
+
 def test_prologue_forwards_the_submit_title_preview_to_the_titler():
     """A paste-shrunk ``display_metadata.title_preview`` from prompt.submit is the text the
     titler should read, not the full pasted body."""
@@ -518,32 +541,3 @@ def test_prologue_forwards_the_submit_title_preview_to_the_titler():
               "display_metadata": {"title_preview": "Pasted 5000 chars"}}],
         )
     assert titler.call_args.kwargs["title_preview"] == "Pasted 5000 chars"
-
-
-def test_read_only_honcho_reaches_api_sidecar_with_existing_history():
-    from agent.memory_manager import MemoryManager
-    from plugins.memory.honcho import HonchoMemoryProvider
-    from plugins.memory.honcho.client import HonchoClientConfig
-
-    provider = HonchoMemoryProvider()
-    provider._apply_config_mode(HonchoClientConfig(
-        read_only=True, read_only_injection=True,
-        session_peer_aliases={'existing-topic': 'group-one'}, context_tokens=500,
-    ))
-    provider._session_key = 'existing-topic'
-    provider._session_initialized = True
-    provider._manager = MagicMock()
-    provider._manager.get_session_context.return_value = {'representation': 'Verified project fact: violet-731.'}
-    mm = MemoryManager()
-    mm.add_provider(provider)
-    agent = _FakeAgent()
-    agent._memory_manager = mm
-    history = [{'role': 'user', 'content': 'Previous request'}, {'role': 'assistant', 'content': 'Previous response'}]
-    ctx = _build(agent, user_message='What was the verified project fact?', conversation_history=history)
-    assert 'violet-731' in ctx.ext_prefetch_cache
-    user = next(m for m in reversed(ctx.messages) if m['role'] == 'user')
-    assert 'violet-731' in user['api_content']
-    assert '<memory-context>' in user['api_content']
-    assert 'violet-731' not in user['content']
-    assert ctx.messages[:2] == history
-    assert agent._cached_system_prompt == 'SYSTEM'
