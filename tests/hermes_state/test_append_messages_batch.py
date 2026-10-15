@@ -268,7 +268,10 @@ def test_failed_insert_does_not_adopt_reused_row_id(db, monkeypatch):
         patcher.setattr(db, "_insert_message_rows", fail_after_insert)
         with pytest.raises(RuntimeError, match="failure after insert"):
             db.append_messages_batch("sess-batch", [message])
-    assert message == {"role": "user", "content": "original requested work"}
+    # Dize: v0.22 mints the logical ``message_uid`` once per occurrence and keeps it across a
+    # retry; only the physical row binding (``_row_id`` / ``_db_row_snapshot``) must roll back.
+    assert {k: v for k, v in message.items() if k != "message_uid"} == {
+        "role": "user", "content": "original requested work"}
     other = {"role": "user", "content": "concurrent work"}
     db.append_messages_batch("sess-batch", [other])
     db.append_messages_batch("sess-batch", [message])

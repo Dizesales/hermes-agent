@@ -2,6 +2,7 @@
 
 import json
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -100,7 +101,7 @@ def test_gateway_platform_uses_hard_stop_default_without_cli_opt_in():
 
     _seed_exact_failures(agent, "web_search", args, count=5)
 
-    decision = getattr(agent, "_tool_guardrails").before_call("web_search", args)
+    decision = agent._tool_guardrails.before_call("web_search", args)
     assert decision.action == "block"
     assert decision.code == "repeated_exact_failure_block"
 
@@ -112,7 +113,7 @@ def test_interactive_platforms_keep_warning_only_default(platform):
 
     _seed_exact_failures(agent, "web_search", args, count=5)
 
-    decision = getattr(agent, "_tool_guardrails").before_call("web_search", args)
+    decision = agent._tool_guardrails.before_call("web_search", args)
     assert decision.action == "allow"
     assert decision.code == "allow"
 
@@ -185,7 +186,7 @@ def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_mes
 
 def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
     agent = _make_agent("terminal")
-    guardrails = getattr(agent, "_tool_guardrails")
+    guardrails = agent._tool_guardrails
     guardrails.after_call(
         "terminal",
         {"command": "bad-1"},
@@ -278,7 +279,6 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
 
     def observe_approval(name, args):
         observed["approval"].append((name, dict(args)))
-        return None
 
     def dispatch(name, args, task_id, **kwargs):
         del task_id, kwargs
@@ -318,7 +318,7 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
     assert observed["start"] == expected
     assert observed["dispatch"] == expected
     assert observed["checkpoint"] == [
-        ("/approved/path", "before write_file")
+        (str(Path("/approved/path")), "before write_file")
     ]
 
 
@@ -371,7 +371,7 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
 
 def _compressed_args(field: str) -> dict:
     """Generate a legacy compression marker for already-contaminated session coverage."""
-    from agent.context_compressor import _COMPRESSION_MARKER_TEMPLATE
+    from agent.compression_marker import _COMPRESSION_MARKER_TEMPLATE
 
     original = "z" * 2000
     marker = _COMPRESSION_MARKER_TEMPLATE.format(
@@ -402,11 +402,20 @@ def test_context_pruned_effectful_call_blocks_before_dispatch():
     assert payload["argument_paths"] == ["$.body"]
     assert "Recover the exact content from its durable source" in payload["message"]
     # Only the compressor's current marker is an artifact; a legacy "...[truncated]" tail is ordinary content.
-    from agent.context_compressor import _COMPRESSION_MARKER_PREFIX
+    from agent.compression_marker import _COMPRESSION_MARKER_PREFIX
     from agent.tool_dispatch_helpers import _context_pruned_argument_paths
 
     assert _context_pruned_argument_paths("write_file", {"content": "x" * 201 + "...[truncated]"}) == []
     assert _context_pruned_argument_paths("write_file", {"content": f"see {_COMPRESSION_MARKER_PREFIX} docs"}) == []
+    assert _context_pruned_argument_paths(
+        "write_file",
+        {"content": f"template {_COMPRESSION_MARKER_PREFIX} {{omitted:,}} of {{total:,}}"},
+    ) == []
+    # A marker cut before its fixed sentence is still an artifact once a count is rendered.
+    for suffix in (" 1,800", " 1,800 of", " 1,800 of 2,000 chars omitted"):
+        assert _context_pruned_argument_paths(
+            "write_file", {"body": f"prefix {_COMPRESSION_MARKER_PREFIX}{suffix}"}
+        ) == ["$.body"]
 
 
 def test_read_only_tool_may_quote_current_context_prune_marker():
