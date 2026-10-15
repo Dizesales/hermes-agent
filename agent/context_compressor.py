@@ -3640,6 +3640,26 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
+    def _fresh_main_api_key(self) -> Any:
+        """Native Anthropic OAuth rotates: the token copied at construction is revoked after the main
+        agent refreshes, and every summary then fails with 401 'OAuth access token has been revoked'.
+        Re-resolve it the same way the main agent does; static keys and other providers are untouched."""
+        key = self.api_key
+        base = str(self.base_url or "")
+        if (self.provider != "anthropic" or not isinstance(key, str) or key.startswith("sk-ant-api")
+                or (base and "anthropic.com" not in base and "claude.com" not in base)):
+            return key
+        try:
+            from agent.anthropic_credentials import resolve_anthropic_token
+            fresh = resolve_anthropic_token(model=self.model)
+        except Exception as exc:  # keep the old key; the aux client's own 401 recovery still runs
+            logger.debug("compressor Anthropic token refresh failed: %s", exc)
+            return key
+        fresh = fresh.strip() if isinstance(fresh, str) else ""
+        if fresh and fresh != key:
+            self.api_key = fresh
+        return self.api_key
+
     def _call_summary_llm(self, prompt: str, prompt_started_at: float) -> str:
         """Issue the single aux summary call; return validated content text.
         Raises RuntimeError for empty content or a length-truncated (PARTIAL) summary so the failure
@@ -3649,7 +3669,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         call_kwargs: Dict[str, Any] = {
             "task": "compression",
             "main_runtime": {
-                "model": self.model, "provider": self.provider, "base_url": self.base_url, "api_key": self.api_key,
+                "model": self.model, "provider": self.provider, "base_url": self.base_url, "api_key": self._fresh_main_api_key(),
                 "api_mode": self.api_mode,
             },
             "messages": [{"role": "user", "content": prompt}], "route_info": _aux_route,

@@ -1127,8 +1127,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         background dialectic, migration, writes or stale-context reuse occurs.
         """
         cfg = self._config
-        if (not cfg or not cfg.read_only_injection or not self._manager
-                or not self._session_initialized or self._is_trivial_prompt(query)):
+        if (not cfg or not cfg.read_only_injection or self._cron_skipped or self._is_trivial_prompt(query)):
             return ""
         # A shared chat must never fall back to its last sender's private peer.
         # DM bindings can also be explicitly provisioned in this existing map.
@@ -1136,6 +1135,8 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         if not peer:
             return ""
         try:
+            if not self._ensure_session():
+                return ""
             ctx = self._manager.get_session_context(
                 self._session_key, peer=peer, query=query,
             )
