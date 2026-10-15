@@ -129,8 +129,7 @@ def _pattern_reaches_host_interpreter(pattern: str, *, full_cmdline: bool, exact
     that names the interpreter and then only wildcards or a `hermes` token reaches it, while
     `python mt_add.py` (a specific script) does not."""
     core = pattern.strip().strip("\"'").lstrip("^")
-    if core.endswith("$"):
-        core = core[:-1]
+    core = core.removesuffix("$")
     head, _, rest = core.partition(" ") if full_cmdline else (core, "", "")
     # A literal interpreter name first (`python3.12`: the dot is a version separator, not an ERE
     # wildcard); only then read the head as an ERE with a metacharacter tail (`python3?`, `python.*`).
@@ -246,12 +245,16 @@ _ARGV_LIST_PUNCTUATION = re.compile(r"[\[\],]+")
 _PROFILE_FLAG_LIFECYCLE_PATTERN = re.compile(
     r"(?i)"
     r"hermes\s+"
-    # Any global flags before the profile selector (each may carry a value).
-    r"(?:-{1,2}\S+(?:\s+\S+)?\s+)*"
+    # Each flag has one parse: '-' plus its remainder, never two ways to split
+    # '--'. A following flag cannot also be an optional value (#129281).
+    # Possessive token/space runs avoid repartitioning whitespace on failure;
+    # whole flag groups can still backtrack to expose the profile selector.
+    # Do not cap the number of flags: that would silently allow long self-stops.
+    r"(?:-\S++(?:\s++(?!-\S)\S++)?\s++)*"
     # The selector: exactly the shapes the CLI's `_apply_profile_override` accepts.
     r"(?:--profile=([^\s]+)|(?:-p|--profile)\s+([^\s]+))"
     # Any global flags between the selector and the subcommand.
-    r"(?:\s+-{1,2}\S+(?:\s+\S+)?)*"
+    r"(?:\s++-\S++(?:\s++(?!-\S)\S++)?)*"
     r"\s+gateway\s+(?:restart|stop)"
 )
 
@@ -474,8 +477,13 @@ class _LifecycleScanBudget:
     failed closed for a reason other than a lifecycle command (budget, size, device, live SQLite,
     cloud placeholder) so the caller can tell the model the real reason (#113944)."""
 
-    __slots__ = ("bytes_remaining", "lines_remaining", "paths_remaining", "remote_reads_remaining",
-                 "refusal")
+    __slots__ = (
+        "bytes_remaining",
+        "lines_remaining",
+        "paths_remaining",
+        "refusal",
+        "remote_reads_remaining",
+    )
 
     def __init__(self) -> None:
         # Read the module constants at construction so tests/operators can lower them at runtime.
@@ -566,6 +574,37 @@ def _unreadable_reason(path: Path) -> str:
     if not stat.S_ISREG(metadata.st_mode):
         return f"`{path}` is not a regular file"
     return f"`{path}` is larger than the scan cap ({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget"
+
+
+# How much of an oversized script the NUL probe reads before accepting it as plain text.
+_OVERSIZED_NUL_PROBE_BYTES = 8 * 1024 * 1024
+
+
+def _has_nul_padded_text(path: Path, limit: int = _OVERSIZED_NUL_PROBE_BYTES) -> bool:
+    """True when the first *limit* bytes of *path* mix NUL padding with real content (bash executes
+    straight past embedded NULs), or when it cannot be read. A NUL-only blob is not a script."""
+    has_nul = has_text = False
+    try:
+        with open(path, "rb") as handle:
+            remaining = limit
+            while remaining > 0 and not (has_nul and has_text):
+                chunk = handle.read(min(remaining, 1024 * 1024))
+                if not chunk:
+                    break
+                has_nul = has_nul or b"\x00" in chunk
+                has_text = has_text or bool(chunk.translate(None, b"\x00 \t\r\n"))
+                remaining -= len(chunk)
+    except (OSError, ValueError):
+        return True
+    return has_nul and has_text
+
+
+def _is_size_only_refusal(reason: str, path: Optional[Path] = None) -> bool:
+    """Hefesto: a large regular file is not a lifecycle risk by itself. Text padded with NULs to
+    look like a blob keeps failing closed."""
+    if "is larger than the scan cap" not in reason:
+        return False
+    return path is None or not _has_nul_padded_text(path)
 
 
 def _refuse_unreadable(budget: _LifecycleScanBudget, path: Path, reason: str) -> bool:
@@ -1144,8 +1183,11 @@ def _contains_unsafe_gateway_action(
         # remainder fails closed exactly like an oversized one.
         script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
         if unsafe:
+            reason = _unreadable_reason(script_path)
+            if candidate_executed and not _is_size_only_refusal(reason, script_path):
+                return _refuse_unreadable(budget, script_path, reason)
             if candidate_executed:
-                return _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
+                logger.warning("lifecycle guard skipped oversized script %s: %s", script_path, reason)
             continue
         if script_text is None and read_remote_script is not None:
             # Local path missing; the remote backend's output crosses the same trust boundary as a
@@ -1159,11 +1201,7 @@ def _contains_unsafe_gateway_action(
             )
             if unsafe:
                 if candidate_executed:
-                    return _refuse_unreadable(
-                        budget, script_path,
-                        f"`{script_path}` read from the backend exceeds the scan cap "
-                        f"({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget",
-                    )
+                    logger.warning("lifecycle guard skipped oversized remote script %s", script_path)
                 continue
         if not script_text:
             continue

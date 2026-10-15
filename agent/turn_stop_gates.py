@@ -58,7 +58,14 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
         from hermes_cli.lifecycle import has_hook
         from hermes_cli.plugins import get_pre_verify_continue_message
 
-        if _edited and has_hook("pre_verify") and attempt < max_verify_nudges():
+        # Existing plugins may reconcile non-file work (delegation, publication,
+        # or a saved project snapshot). Explicit profile opt-in preserves the
+        # default code-edit gate and the native continuation budget/alternation.
+        _on_stop = False
+        if not _edited:
+            from hermes_cli.config import load_config_readonly
+            _on_stop = (load_config_readonly().get("agent") or {}).get("pre_verify_on_stop") is True
+        if (_edited or _on_stop) and has_hook("pre_verify") and attempt < max_verify_nudges():
             # Posture is fixed for the session — resolve once + cache.
             coding = getattr(agent, "_resolved_is_coding", None)
             if coding is None:
@@ -103,7 +110,7 @@ def _append_interim_answer(agent, final_msg, messages, conversation_history, flu
 
 
 def apply_stop_gates(
-    agent: Any, final_msg: Dict[str, Any], *, final_response: Any, messages: List[Dict[str, Any]],
+    agent: Any, final_msg: dict[str, Any], *, final_response: Any, messages: list[dict[str, Any]],
     conversation_history: Any, pending_verification_response: Any,
     pending_verification_response_previewed: Any,
 ) -> StopGateVerdict:
@@ -122,6 +129,8 @@ def apply_stop_gates(
         return StopGateVerdict(
             continue_turn=True, final_response=None,
             pending_verification_response=final_response,
+            # Prefix semantics on purpose: the streamed prefix IS on screen here. The gateway
+            # interim verdict uses _interim_content_fully_streamed instead (#88954).
             pending_verification_response_previewed=agent._interim_content_was_streamed(
                 final_response or ""
             ),

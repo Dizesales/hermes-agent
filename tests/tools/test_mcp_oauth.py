@@ -97,7 +97,7 @@ class TestHermesTokenStorage:
         data = json.loads(token_path.read_text())
         assert data["access_token"] == "abc123"
 
-    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX mode bits not enforced on Windows")
+    @pytest.mark.platforms("posix")  # POSIX mode bits not enforced on Windows
     def test_token_file_created_with_0o600(self, tmp_path, monkeypatch):
         """Tokens must land on disk at 0o600 with no umask-default exposure window.
 
@@ -1114,7 +1114,10 @@ def test_back_to_back_oauth_providers_keep_independent_ports(monkeypatch):
             self.kwargs = kwargs
 
     monkeypatch.setattr(mod, "_OAUTH_AVAILABLE", True)
-    monkeypatch.setattr(mod, "OAuthClientProvider", _FakeProvider)
+    # Dize: v0.22 resolves the SDK provider through ``_sdk_class`` and caches the Hermes subclass.
+    mod._sdk_class("OAuthClientProvider")
+    monkeypatch.setitem(mod._SDK_CLASSES, "OAuthClientProvider", _FakeProvider)
+    monkeypatch.setattr(mod, "HermesOAuthClientProvider", None)
     monkeypatch.setattr(mod, "_is_interactive", lambda: True)
     monkeypatch.setattr(mod, "_maybe_preregister_client", lambda *a: None)
     redirect_ports = []
@@ -1151,3 +1154,34 @@ def test_back_to_back_oauth_providers_keep_independent_ports(monkeypatch):
 
     assert redirect_ports == [41001, 41002]
     assert callback_ports == [41001, 41002]
+
+
+def test_humanize_404_registration_error_guidance():
+    """A 404 on the registration endpoint surfaces pre-registered-client
+    guidance instead of the raw SDK traceback (GH#78190 — Google's hosted
+    Gmail/Drive MCP servers answer the SDK's guessed /register with 404)."""
+    from tools.mcp_oauth import humanize_oauth_registration_error
+
+    msg = humanize_oauth_registration_error(
+        "gmail",
+        "Registration failed: 404 <html>Error 404 (Not Found)!!1</html>",
+        server_url="https://gmailmcp.googleapis.com/mcp/v1",
+    )
+    assert msg is not None
+    assert "does not support automatic client registration" in msg
+    assert "client_id" in msg
+    assert "hermes mcp login gmail" in msg
+
+
+def test_humanize_404_non_registration_passthrough():
+    """A 404 that has nothing to do with registration stays raw."""
+    from tools.mcp_oauth import humanize_oauth_registration_error
+
+    assert (
+        humanize_oauth_registration_error(
+            "srv",
+            RuntimeError("HTTP 404: no such tool"),
+            server_url="https://example.com/mcp",
+        )
+        is None
+    )

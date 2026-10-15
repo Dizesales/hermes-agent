@@ -38,9 +38,9 @@ def test_allowlisted_name_function_heredoc_stays_visible(tmp_path):
 
 
 def test_unquoted_heredoc_body_path_still_walked(tmp_path):
-    """An expansion-capable body is not provably inert: the walk still sees it and fails closed."""
+    """Hefesto: the walk still sees the body, but a large benign file is skipped, not refused."""
     big = _big_file(tmp_path)
-    assert guard(f"cat > /tmp/x <<EOF\n{big}\nEOF", cwd=str(tmp_path)) is True
+    assert guard(f"cat > /tmp/x <<EOF\n{big}\nEOF", cwd=str(tmp_path)) is False
 
 
 def test_inert_heredoc_body_script_path_still_read(tmp_path):
@@ -56,7 +56,7 @@ def test_mentioned_data_file_that_cannot_be_scanned_is_not_a_verdict(tmp_path, m
     """A file only MENTIONED in an inert body may exhaust the text budget (one >64 KiB line), pull
     in 64+ remote-read misses (a markdown table of paths) or be a live SQLite database: each is
     "nothing to scan", never a block (#113944). The same file *executed* still fails closed."""
-    import cron.lifecycle_guard as lifecycle_guard
+    from cron import lifecycle_guard
     from hermes_cli.sqlite_safe_read import connect_tracked
 
     minified = tmp_path / "minified.json"
@@ -70,7 +70,6 @@ def test_mentioned_data_file_that_cannot_be_scanned_is_not_a_verdict(tmp_path, m
 
     def remote(path: str):
         remote_misses.append(path)
-        return None
 
     try:
         for data in (minified, notes, db):
@@ -88,7 +87,7 @@ def test_mentioned_data_file_that_cannot_be_scanned_is_not_a_verdict(tmp_path, m
 def test_mentioned_script_with_lifecycle_command_still_blocks(tmp_path):
     """The lenient path only covers "could not scan": a mentioned script whose text IS a lifecycle
     command is still a positive verdict, and the refusal reason stays empty (it is not a scan failure)."""
-    import cron.lifecycle_guard as lifecycle_guard
+    from cron import lifecycle_guard
 
     script = tmp_path / "restart.sh"
     script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
