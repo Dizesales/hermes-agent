@@ -407,6 +407,12 @@ async def recover_gateway_native_sessions(runner):
                     outcome[sid] = 'ready (lost turn discarded)'
             except Exception:
                 logger.exception('Dize lost-turn recovery failed; paused sessions stay paused')
+            from gateway.dize_lost_turn_recovery import resume_restart_interrupted_turns
+            try:
+                for sid in await resume_restart_interrupted_turns(runner, authority):
+                    outcome[sid] = 'resumed (cut by the previous shutdown)'
+            except Exception:
+                logger.exception('Dize restart recovery failed; interrupted chats were not resumed')
         for sid, verdict in outcome.items():
             logger.info('Native session startup recovery %s (%s): %s', sid, authority.profile_id, verdict)
         results.update(outcome)
