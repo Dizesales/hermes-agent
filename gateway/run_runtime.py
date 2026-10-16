@@ -400,6 +400,13 @@ async def recover_gateway_native_sessions(runner):
                         for entry in runner.session_store.list_sessions() if entry.origin is not None
                         for owner in [authority.logical_owner(entry.session_id)] if owner in pending]
             outcome = await authority.recover_native_sessions(bindings)
+            # Dize (opt-in): a turn lost to an abrupt stop no longer pauses its chat forever.
+            from gateway.dize_lost_turn_recovery import discard_lost_chat_turns
+            try:
+                for sid in await discard_lost_chat_turns(runner, authority, outcome):
+                    outcome[sid] = 'ready (lost turn discarded)'
+            except Exception:
+                logger.exception('Dize lost-turn recovery failed; paused sessions stay paused')
         for sid, verdict in outcome.items():
             logger.info('Native session startup recovery %s (%s): %s', sid, authority.profile_id, verdict)
         results.update(outcome)
