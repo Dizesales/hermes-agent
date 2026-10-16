@@ -126,6 +126,17 @@ def admission_display(payload):
     return card
 
 
+def _route_identity(source):
+    """Dize: the source minus its platform reply id. Telegram topic sources carry the human
+    message's id, while synthetic completion/watch events drop it (#52694) so the reply does
+    not quote a stale message; comparing it refused every such automation ``admission_conflict``
+    and the producer requeued it forever. The reply id is not identity: chat, thread, user,
+    scope and profile still must match exactly."""
+    data = source.to_dict()
+    data.pop('message_id', None)
+    return data
+
+
 def snapshot_automation(authority, adapter, event, identity):
     runner = authority.runner
     if (not event.internal or event.message_type != MessageType.TEXT or event.is_command()
@@ -152,11 +163,12 @@ def snapshot_automation(authority, adapter, event, identity):
     # Recheck only the source/provenance: a completed input's retained media is already released.
     restored = restore_native({'text': event.text, 'native_text_v1': {
         key: value for key, value in envelope.items() if key != 'media'}}, runner)
-    if (restored.source.to_dict() != event.source.to_dict()
+    if (_route_identity(restored.source) != _route_identity(event.source)
             or runner._adapter_for_source(restored.source) is not adapter):
         raise RuntimeStoreError('admission_conflict')
     provenance = deepcopy(envelope['provenance'])
     source = deepcopy(envelope['source'])
+    source.pop('message_id', None)  # Dize: the borrowed human reply id must not anchor the turn (#52694)
     # Producer timestamps and platform reply IDs change on retry. Neither belongs
     # in the identity/fingerprint of the same immutable completion.
     envelope = {'source': source, 'route': entry.session_key,
