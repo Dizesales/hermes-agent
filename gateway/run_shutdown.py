@@ -1646,7 +1646,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         restart-safe external worker (``_restart_safe_cron_count``), which outlives this process
         either way. Cron runs are counted per profile-scoped run by the scheduler, not by
         subtracting from the bare-ID active count: two profiles can run the same job ID, and one
-        excluded run must not hide the other.
+        excluded run must not hide the other. Hefesto native delegations (drain overlay) are never
+        excluded: they die with this process, so the wait holds for them like a live turn.
         """
         non_cron = (
             self._running_agent_count()
@@ -1657,6 +1658,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         return (
             max(0, non_cron - self._wedged_chat_agent_count())
             + self._restart_wait_cron_counts()["awaitable"]
+            + len(_native_delegation_units(self))
         )
 
     def _describe_active_work(self) -> list:
