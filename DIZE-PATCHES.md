@@ -71,15 +71,18 @@ Detalhe de cada item (motivo, evidência, teste comportamental): `docs/dize/inve
 | TST-02 | testes de regressão de hook assíncrono `pre_gateway_dispatch` | frota (plugins com hook async) | código já nativo; **testes MANTER** |
 | F11 | Espera de reinício conta só delegações vivas (`_LIVE_STATES`); registro com `timeout`/`unknown` não vira unidade fantasma | Hefesto | NOVO neste candidato (730868bb), testes em `tests/gateway/test_restart_drain.py` |
 | F12 | Kanban: tarefa já decomposta e devolvida para triagem não paga nova chamada ao decompositor | frota | NOVO neste candidato (e35adc20), testes em `tests/hermes_cli/test_kanban_decompose.py` e `tests/gateway/test_kanban_auto_decompose_secret_scope.py` |
+| F13 | Aviso automático (conclusão de delegação, watch) não compara nomes de exibição (`chat_name`, `user_name`, `chat_topic`, `auto_thread_initial_name`) com a última mensagem humana: renomear grupo/tópico ou o nome de um usuário não vira `admission_conflict`. IDs, tópico, perfil e adapter continuam exigidos. DIVERGE do upstream (que testa `user_name` como deriva recusada) | frota | NOVO 26/10, testes em `tests/gateway/test_automation_notification_category.py` |
 
 ## Fora deste repositório (plugins do perfil Hefesto, repo DizeHefesto)
 
 | Item | Situação |
 |---|---|
 | `dize-project-delegation/local_adapter.py` herda `LocalSessionAdapter` (slot LOCAL) | instalado 26/10; suíte do plugin sem falha nova no candidato |
-| `dize-project-delegation/tests/test_local_transport.py`: dublê de `SessionEntry` precisa de `platform` (v0.22.5 lê `entry.platform` em `_closed_local_target`) | ajustar no repo antes de promover; só teste |
+| `dize-project-delegation/tests/test_local_transport.py`: dublê de `SessionEntry` precisa de `platform` (v0.22.5 lê `entry.platform` em `_closed_local_target`) | feito 26/10 (B5) |
+| `dize-project-delegation/tests/test_native_callback.py`: dublê do pre-flight precisa de `owner_session_id`/`proven_session_id`/`defer` | feito 26/10 (F6) |
+| `dize-project-delegation/local_adapter.py`: ao conectar, adota as sessões locais restauradas no adapter padrão (F4, `paused: storage_unavailable` no boot) | 26/10 |
 | `kanban.auto_decompose: false` no config do Hefesto | ligado 26/10 como trava; com F12 pode voltar a `true` se o Lucas quiser |
-| `dize-project-delegation/client.py` repo ≠ perfil (F6) | decisão do Lucas |
+| `dize-project-delegation/client.py` repo ≠ perfil (F6) | resolvido 26/10: perfil = repo |
 
 ## Ressalvas conhecidas do upstream que afetam o Hefesto
 

@@ -202,7 +202,7 @@ async def test_native_completion_wake_admits_when_source_differs_only_by_message
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('field', ['user_name', 'user_id', 'thread_id'])
+@pytest.mark.parametrize('field', ['user_id', 'thread_id', 'user_id_alt'])
 async def test_native_completion_wake_refuses_other_source_drift(tmp_path, monkeypatch, field):
     _runner, authority, adapter, _source, metadata = await _native_owner(tmp_path, monkeypatch, 'human-1')
     try:
@@ -210,6 +210,23 @@ async def test_native_completion_wake_refuses_other_source_drift(tmp_path, monke
         event = MessageEvent(text='notice', source=drifted, internal=True, metadata=dict(metadata))
         with pytest.raises(RuntimeStoreError, match='admission_conflict'):
             await authority.admit_automation(adapter, event, 'notice')
+    finally:
+        authority.db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('field', ['chat_name', 'user_name', 'chat_topic'])
+async def test_native_completion_wake_admits_display_name_drift(tmp_path, monkeypatch, field):
+    """Dize F13: a renamed group/topic or user display name is not another route. The stored
+    origin keeps the creation-time names, so refusing here blocked every later completion."""
+    _runner, authority, adapter, _source, metadata = await _native_owner(tmp_path, monkeypatch, 'human-1')
+    try:
+        drifted = adapter.build_source(**{**_SOURCE, field: 'renamed'})
+        event = MessageEvent(text='notice', source=drifted, internal=True, metadata=dict(metadata))
+        receipt = await authority.admit_automation(adapter, event, 'notice')
+        row = get_session_admission(authority.db, admission_id=receipt.admission_id)
+        # The admitted turn borrows the committed human source, never the drifted names.
+        assert row['payload']['native_text_v1']['source'].get(field) == _SOURCE.get(field)
     finally:
         authority.db.close()
 
@@ -236,8 +253,8 @@ async def test_refused_watch_wake_logs_the_refusal_code(tmp_path, monkeypatch, c
     runner, authority, _adapter, source, metadata = await _native_owner(tmp_path, monkeypatch, 'human')
     try:
         route = metadata['gateway_session_key']
-        # Point the routing entry at a renamed user: the wake's source no longer matches the commit.
-        runner.session_store._entries[route].origin = replace_source(source, user_name='renamed')
+        # Point the routing entry at another user identity: the wake's source no longer matches the commit.
+        runner.session_store._entries[route].origin = replace_source(source, user_id_alt='other')
         evt = {'type': 'completion', 'session_id': 'proc_x', 'session_key': route, 'platform': 'discord',
                'chat_id': '42', 'chat_type': 'dm', 'exit_code': 0, 'output': 'done', 'started_at': 1.0,
                'parent_session_id': metadata['gateway_session_id']}

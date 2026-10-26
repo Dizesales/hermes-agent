@@ -346,8 +346,16 @@ def admission_display(payload):
     return card
 
 
+# Dize F13: display names are not route identity. The routing entry's origin is written once, when
+# the session is created, so a renamed group/topic or a user's new display name would refuse every
+# later completion of that session (``admission_conflict``) until /new. Who and where still must
+# match exactly: platform, chat, thread, user ids, scope, profile, and the live adapter.
+_NON_IDENTITY_SOURCE_KEYS = frozenset({'message_id', 'chat_name', 'user_name', 'chat_topic',
+                                       'auto_thread_initial_name'})
+
+
 def _route_identity(source):
-    return {key: value for key, value in source.to_dict().items() if key != 'message_id'}
+    return {key: value for key, value in source.to_dict().items() if key not in _NON_IDENTITY_SOURCE_KEYS}
 
 
 def committed_route_envelope(authority, entry):
