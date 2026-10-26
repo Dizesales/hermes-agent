@@ -248,15 +248,16 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                         status = record.get('status')
                         if not isinstance(status, str) or not status:
                             raise TypeError('Invalid native delegation status')
-                        # Matches async_delegation.active_count, including persistence/queue handoff.
-                        if status in ('running', 'stalling', 'finalizing'):
+                        # Matches async_delegation.active_count, including persistence/queue handoff:
+                        # only live states are work. Any other status (timeout, unknown, rejected...)
+                        # is a finished record kept for lookup; counting it held every later restart
+                        # for the full restart_after_turn_timeout with no real work.
+                        live = getattr(module, '_LIVE_STATES', ('running', 'stalling', 'finalizing'))
+                        if status in live:
                             units[('delegation', record_id)] = {
                                 'kind': 'delegation', 'delegation_id': record_id,
                                 'state': status, 'pid': os.getpid(), 'child_count': 0,
                             }
-                        elif status not in ('completed', 'error', 'failed', 'interrupted',
-                                            'cancelled', 'canceled', 'stalled'):
-                            unknown = True
             except Exception:
                 unknown = True
             finally:

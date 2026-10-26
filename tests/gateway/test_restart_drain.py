@@ -786,3 +786,50 @@ async def test_restart_after_turn_wait_holds_for_native_delegation(monkeypatch, 
     assert not waiter.done(), "a running delegation must hold the restart wait"
     units.clear()
     assert await asyncio.wait_for(waiter, timeout=2.0) is True
+
+
+def _fake_delegation_modules(monkeypatch, records):
+    import sys
+    import threading
+    import types
+    from pathlib import Path
+    monkeypatch.setattr("hermes_constants.get_process_hermes_home",
+                        lambda: Path("/root/.hermes/profiles/hefesto"))
+    async_mod = types.ModuleType("tools.async_delegation")
+    async_mod._records = records
+    async_mod._records_lock = threading.Lock()
+    async_mod._LIVE_STATES = {"running", "stalling", "finalizing"}
+    registry = types.ModuleType("tools.delegate_tool_registry")
+    registry._active_subagents = {}
+    registry._active_subagents_lock = threading.Lock()
+    monkeypatch.setitem(sys.modules, "tools.async_delegation", async_mod)
+    monkeypatch.setitem(sys.modules, "tools.delegate_tool_registry", registry)
+
+
+@pytest.mark.parametrize("status", ["timeout", "unknown", "rejected", "completed", "error", "stalled"])
+def test_finished_native_delegation_record_is_not_restart_work(monkeypatch, tmp_path, status):
+    """F11: a retained finished record (e.g. a child that timed out) must not become a phantom
+    ``delegation_unknown`` unit that holds every later restart for restart_after_turn_timeout."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("cron.jobs.load_jobs", list)
+    runner, _adapter = make_restart_runner()
+    _fake_delegation_modules(monkeypatch, {"d1": {"status": status}})
+    assert runner._native_delegation_work_snapshot() == []
+
+
+@pytest.mark.parametrize("status", ["running", "stalling", "finalizing"])
+def test_live_native_delegation_record_is_restart_work(monkeypatch, tmp_path, status):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("cron.jobs.load_jobs", list)
+    runner, _adapter = make_restart_runner()
+    _fake_delegation_modules(monkeypatch, {"d1": {"status": status}})
+    units = runner._native_delegation_work_snapshot()
+    assert [(u["kind"], u["delegation_id"], u["state"]) for u in units] == [("delegation", "d1", status)]
+
+
+def test_corrupt_native_delegation_record_stays_conservative(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("cron.jobs.load_jobs", list)
+    runner, _adapter = make_restart_runner()
+    _fake_delegation_modules(monkeypatch, {"d1": {"status": None}})
+    assert [u["kind"] for u in runner._native_delegation_work_snapshot()] == ["delegation_unknown"]
