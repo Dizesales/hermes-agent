@@ -312,6 +312,11 @@ def decompose_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+    if already_decomposed(task_id):
+        # decompose_triage_task refuses a re-triaged root that already fanned out, but only
+        # after the paid LLM call; checking first stops a re-triaged root (block loop) from
+        # costing one decomposer call per dispatcher tick forever.
+        return DecomposeOutcome(task_id, False, ALREADY_DECOMPOSED_REASON)
 
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(
@@ -334,6 +339,17 @@ def decompose_task(
     if not parsed.get("fanout"):
         return _apply_single(task, parsed, routing, audit_author)
     return _apply_fanout(task_id, parsed, routing, audit_author)
+
+
+ALREADY_DECOMPOSED_REASON = "task already decomposed (re-triaged root is not decomposed again)"
+
+
+def already_decomposed(task_id: str) -> bool:
+    """True when the task already has a ``decomposed`` event (same rule as decompose_triage_task)."""
+    with kbc.connect_closing() as conn:
+        return conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decomposed' LIMIT 1", (task_id,),
+        ).fetchone() is not None
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:

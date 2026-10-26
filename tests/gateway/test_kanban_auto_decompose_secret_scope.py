@@ -47,3 +47,19 @@ def test_auto_decompose_tick_reads_launch_profile_secrets_under_multiplex(monkey
     assert decomposed == 1
     assert seen["value"] == "launch-profile-key"
     assert ss.current_secret_scope() is None
+
+
+def test_auto_decompose_skips_already_decomposed_without_using_a_slot():
+    """F12: the tick skips a re-triaged decomposed root before counting it against the per-tick cap."""
+    from types import SimpleNamespace
+    from gateway.kanban_watchers_dispatcher import _KanbanDispatcher as KanbanDispatcher
+    calls = []
+    fake = SimpleNamespace(already_decomposed=lambda tid: tid == "t_loop")
+    assert KanbanDispatcher._skip_already_decomposed(fake, "default", "t_loop") is True
+    assert KanbanDispatcher._skip_already_decomposed(fake, "default", "t_new") is False
+    # Older decomposer module without the helper: never skip.
+    assert KanbanDispatcher._skip_already_decomposed(SimpleNamespace(), "default", "t_loop") is False
+    # A failing check never blocks decomposition.
+    def boom(tid):
+        raise RuntimeError("db busy")
+    assert KanbanDispatcher._skip_already_decomposed(SimpleNamespace(already_decomposed=boom), "default", "t_loop") is False

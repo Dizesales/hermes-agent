@@ -256,3 +256,39 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+
+
+def test_retriaged_decomposed_root_skips_the_paid_llm_call(kanban_home):
+    """F12: a root that already fanned out and was re-triaged (block loop) must not pay a
+    decomposer call that decompose_triage_task would refuse anyway."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="ship a feature", triage=True)
+    llm_payload = jsonlib.dumps({
+        "fanout": True, "rationale": "split",
+        "tasks": [{"title": "a", "body": "", "assignee": "engineer", "parents": []}],
+    })
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            first = decomp.decompose_task(tid, author="me")
+        assert first.ok and first.fanout
+        assert decomp.already_decomposed(tid)
+        with kbc.connect() as conn:
+            conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (tid,))
+            conn.commit()
+        with _patch_aux_client(llm_payload) as call_llm, _patch_extra_body():
+            second = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+    assert second.ok is False
+    assert second.reason == decomp.ALREADY_DECOMPOSED_REASON
+    call_llm.assert_not_called()
+
+
+def test_fresh_triage_task_is_not_already_decomposed(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="fresh", triage=True)
+    assert decomp.already_decomposed(tid) is False

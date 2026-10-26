@@ -275,6 +275,8 @@ class _KanbanDispatcher:
                     for tid in triage_ids:
                         if attempted >= auto_decompose_per_tick:
                             break
+                        if self._skip_already_decomposed(_decomp, slug, tid):
+                            continue
                         attempted += 1
                         successes += self._decompose_one(_decomp, slug, tid)
                 finally:
@@ -283,6 +285,25 @@ class _KanbanDispatcher:
                     else:
                         os.environ["HERMES_KANBAN_BOARD"] = prev_env
         return successes
+
+    _logged_already_decomposed: set = set()
+
+    @classmethod
+    def _skip_already_decomposed(cls, _decomp: Any, slug: str, tid: str) -> bool:
+        """A re-triaged root that already fanned out is skipped without an LLM call or a per-tick slot."""
+        check = getattr(_decomp, "already_decomposed", None)
+        if check is None:
+            return False
+        try:
+            if not check(tid):
+                return False
+        except Exception:
+            return False
+        if (slug, tid) not in cls._logged_already_decomposed:
+            cls._logged_already_decomposed.add((slug, tid))
+            logger.info("kanban auto-decompose [%s]: %s stays in triage: already decomposed once; "
+                        "needs a human or worker decision, not another decomposition", slug, tid)
+        return True
 
     @staticmethod
     def _decompose_one(_decomp: Any, slug: str, tid: str) -> int:
