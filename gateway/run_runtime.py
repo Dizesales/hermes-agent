@@ -552,8 +552,38 @@ async def recover_gateway_native_sessions(runner):
         with owner_scope(authority):
             recover_local_sessions(authority, schedule=True)
             await recover_webhook_finalizations(authority)
-        results.update(await recover_profile_native_sessions(runner, authority))
+        outcome = await recover_profile_native_sessions(runner, authority)
+        # Dize (opt-in, boot only; not the hot-serve reconcile that reuses recover_profile_native_sessions).
+        with owner_scope(authority):
+            dize = await _dize_startup_recovery(runner, authority, outcome)
+        for sid, verdict in dize.items():
+            logger.info('Native session startup recovery %s (%s): %s', sid, authority.profile_id, verdict)
+        outcome.update(dize)
+        results.update(outcome)
     return results
+
+
+async def _dize_startup_recovery(runner, authority, outcome):
+    """Dize (opt-in by env): ``{session_id: verdict}`` for chats unpaused or resumed at boot.
+
+    ``discard_lost_chat_turns``: a human/automation turn lost to an abrupt stop no longer pauses its
+    chat until someone sends ``/discard`` (HERMES_DIZE_AUTO_DISCARD_LOST_TURNS). Upstream already
+    settles unattended automation rows before this runs (``settle_recovered_unattended``).
+    ``resume_restart_interrupted_turns``: one automation turn resumes a chat whose turn the previous
+    owner's shutdown cut (HERMES_DIZE_RESUME_INTERRUPTED_TURNS=ask|continue). Each step fails soft."""
+    from gateway.dize_lost_turn_recovery import discard_lost_chat_turns, resume_restart_interrupted_turns
+    verdicts = {}
+    try:
+        for sid in await discard_lost_chat_turns(runner, authority, outcome):
+            verdicts[sid] = 'ready (lost turn discarded)'
+    except Exception:
+        logger.exception('Dize lost-turn recovery failed; paused sessions stay paused')
+    try:
+        for sid in await resume_restart_interrupted_turns(runner, authority):
+            verdicts[sid] = 'resumed (cut by the previous shutdown)'
+    except Exception:
+        logger.exception('Dize restart recovery failed; interrupted chats were not resumed')
+    return verdicts
 
 
 async def recover_profile_native_sessions(runner, authority):

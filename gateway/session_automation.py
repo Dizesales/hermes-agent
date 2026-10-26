@@ -308,7 +308,27 @@ def automation_display_metadata(metadata):
 # proof at execution from the target the pre-claim check validated, and the turn's resolver reads it.
 _AUTOMATION_METADATA = frozenset({'gateway_session_key', 'gateway_session_id', 'automation_identities',
     'turn_author', 'notification_origin', 'original_trigger_message_id', 'notification_category',
-    'display_kind', 'display_text', 'gateway_proven_session_id', 'gateway_completion_ids', 'heartbeat_tick'})
+    'display_kind', 'display_text', 'gateway_proven_session_id', 'gateway_completion_ids', 'heartbeat_tick',
+    'async_delegation_ids', 'async_delegation_interim'})
+
+
+def dize_delegation_metadata(metadata):
+    """Dize: async-delegation ids carried by a completion turn and its interim (failure-notice) flag.
+
+    Observational only (plugins read them from the turn's gateway_event_context); they ride the
+    persisted automation descriptor like ``identities`` so a replayed admission keeps them. The
+    default (no ids / not interim) is omitted so other producers' fingerprints are unchanged."""
+    ids = metadata.get('async_delegation_ids')
+    if ids is None:
+        return {}
+    if not isinstance(ids, list) or not all(isinstance(i, str) and i for i in ids) or len(ids) > 64:
+        raise RuntimeStoreError('invalid_params')
+    if not ids:
+        return {}
+    out = {'async_delegation_ids': list(dict.fromkeys(ids))}
+    if metadata.get('async_delegation_interim') is True:
+        out['async_delegation_interim'] = True
+    return out
 
 
 def admission_display(payload):
@@ -350,7 +370,8 @@ def snapshot_automation(authority, adapter, event, identity):
             or set(event.metadata) - _AUTOMATION_METADATA):
         raise RuntimeStoreError('invalid_params')
     notification = (automation_notification_metadata(event.metadata) | automation_display_metadata(event.metadata)
-                    | _tick_metadata(event.metadata))
+                    | _tick_metadata(event.metadata)
+                    | dize_delegation_metadata(event.metadata))
     entry = _owner(runner, event, authority)
     if event.source.platform == Platform.LOCAL:
         return snapshot_local_automation(authority, adapter, event, identity, entry)
@@ -417,6 +438,7 @@ def snapshot_local_automation(authority, adapter, event, identity, entry):
     descriptor.update(automation_notification_metadata(event.metadata))
     descriptor.update(automation_display_metadata(event.metadata))
     descriptor.update(_tick_metadata(event.metadata))
+    descriptor.update(dize_delegation_metadata(event.metadata))
     if event.metadata.get('turn_author') is not None:
         from agent.turn_author import parse_turn_author
         descriptor['turn_author'] = parse_turn_author(event.metadata['turn_author'])
@@ -455,6 +477,7 @@ def restore_local_automation(authority, ref, row):
             'gateway_session_id': entry.session_id})
     event.metadata.update(automation_notification_metadata(descriptor))
     event.metadata.update(automation_display_metadata(descriptor))
+    event.metadata.update(dize_delegation_metadata(descriptor))
     if descriptor.get('turn_author') is not None:
         event.metadata['turn_author'] = deepcopy(descriptor['turn_author'])
     if descriptor.get('heartbeat'):

@@ -78,6 +78,21 @@ def _refusal_retry_at(step: int) -> float:
         step, base_delay=_WATCH_INJECTION_RETRY_BASE_DELAY,
         max_delay=_COMPLETION_INJECTION_RETRY_MAX_DELAY, jitter_ratio=0.0)
 
+# Dize: durable-path sentinel for a terminal no-route verdict (``_inject_watch_notification``).
+_SYNTHETIC_EVENT_NO_ROUTE = object()
+
+
+def _raw_route_is_terminal(runner, evt: dict) -> bool:
+    """Dize: a raw (non ``agent:``) session key with no API server to self-post through is a
+    CLI/desktop-only origin, dropped instead of requeued after every boot. Only conclusive while the
+    gateway has live adapters and none is the API server; before adapters come up (or for an
+    API-origin event) it stays a quiet, uncounted defer, as upstream does."""
+    if evt.get("origin_session_id") or evt.get("platform") == "api_server":
+        return False
+    adapters = getattr(runner, "adapters", None) or {}
+    return bool(adapters) and Platform.API_SERVER not in adapters
+
+
 # Durable async-delegation claim transitions: kind -> (tools.async_delegation function, failure log).
 _DURABLE_CLAIM_OPS = {
     "drop": ("drop_completion_delivery", "Could not drop durable completion claim"),
@@ -166,6 +181,12 @@ def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
         metadata["gateway_proven_session_id"] = proven_session_id
     if completion_ids := evt.get("completion_ids"):
         metadata["gateway_completion_ids"] = list(completion_ids)
+    if evt.get("type") == "async_delegation":
+        # Dize: delegation ids carried by this turn plus the interim (failure-notice) flag.
+        metadata["async_delegation_ids"] = list(dict.fromkeys(
+            str(value) for value in evt.get("_admitted_delegation_ids", [evt.get("delegation_id")])
+            if value))
+        metadata["async_delegation_interim"] = bool(evt.get("task_failure_notice"))
     return metadata
 
 
@@ -867,6 +888,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
 
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict, *, raise_not_accepted: bool = False,
+        no_route_sentinel: bool = False,
     ) -> Optional[bool]:
         """Inject a watch/completion notification as a synthetic message event.
 
@@ -874,7 +896,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         ``True`` on adapter acceptance, ``False`` on retryable adapter failure, ``None`` with no
         gateway route or a refused notice pinned to a permanently-gone session (``_watch_pin_gone``).
         Not transactional: a crash after acceptance can replay (at-least-once).
+        Dize: with ``no_route_sentinel`` (durable completion path) a terminal no-route verdict is
+        ``_SYNTHETIC_EVENT_NO_ROUTE`` so the caller drops the claim instead of releasing it.
         """
+        no_route = _SYNTHETIC_EVENT_NO_ROUTE if no_route_sentinel else None
         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
@@ -888,12 +913,14 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     "Deferring watch notification for raw session %s: no api_server adapter to self-post through",
                     raw_sid,
                 )
-                return False
+                if not _raw_route_is_terminal(self, evt):
+                    return False
+                return no_route
             logger.warning(
                 "Dropping watch notification with no routing metadata for process %s",
                 evt.get("session_id", "unknown"),
             )
-            return None
+            return no_route
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         adapter = self._resolve_injection_adapter(platform_name, source)
         if not adapter and platform_name == Platform.API_SERVER.value and getattr(source, "profile", None):
@@ -1094,6 +1121,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         else:
             raw_sid = _raw_process_event_session_id(evt)
             adapter = self.adapters.get(Platform.API_SERVER) if raw_sid else None
+            if adapter is None and _raw_route_is_terminal(self, evt):
+                return True  # Permit a terminal disposition for CLI/desktop-only origins.
             if adapter is not None and adapter_supports_push(adapter):
                 return False
         if adapter is None:
@@ -1232,7 +1261,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             return None  # Suppressed noise is terminal, not a consumed process result.
         identity = self._completion_delivery_identity(evt)
         claim = self._CompletionClaim()
-        accepted = identity_claimed = refused = False
+        accepted = identity_claimed = refused = unroutable = False
         try:
             claim = await self._preflight_completion_delivery(evt)
             if not claim.proceed:
@@ -1254,7 +1283,16 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             completion_ids = [claim.delegation_id] if claim.claim_id else []
             completion_ids += [sibling["delegation_id"] for sibling, claim_id in sibling_claims if claim_id]
             evt = {**evt, "completion_ids": completion_ids}
-            injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
+            # Dize: preserve the identities of precisely the claimed siblings carried in this turn.
+            # Metadata is observational: it never changes routing, claim settlement or authority.
+            if evt.get("type") == "async_delegation":
+                evt = {**evt, "_admitted_delegation_ids": [
+                    evt.get("delegation_id"), *[sibling.get("delegation_id") for sibling, _ in sibling_claims]]}
+            injection_result = await self._inject_watch_notification(
+                synth_text, evt, raise_not_accepted=True, no_route_sentinel=True)
+            if injection_result is _SYNTHETIC_EVENT_NO_ROUTE:
+                unroutable = True
+                return None
             if injection_result is not True:
                 return injection_result
             accepted = True
@@ -1272,7 +1310,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if identity_claimed and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
-            operation = "complete" if accepted else "defer" if refused or claim.defer else "release"
+            operation = "drop" if unroutable else "complete" if accepted else "defer" if refused or claim.defer else "release"
             if claim.claim_id:
                 self._settle_durable_claim(operation, claim.delegation_id, claim.claim_id)
             for sibling, claim_id in sibling_claims:
@@ -1672,12 +1710,23 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         from gateway.run import _non_conversational_metadata
         source = await asyncio.to_thread(self._build_process_event_source, watcher)
         adapter = self._resolve_injection_adapter(platform_name, source)
+        watcher["delivery"] = {"status": "FAILED", "chat_id": chat_id, "thread_id": thread_id, "message_id": None}
         if adapter and chat_id:
-            with _log_suppressed(logging.ERROR, "Watcher delivery error: %s"):
+            try:
                 send_meta = {"thread_id": thread_id} if thread_id else None
-                await adapter.send(
-                    chat_id, message_text, metadata=_non_conversational_metadata(send_meta, platform=platform_name),
-                )
+                for attempt in range(3):
+                    result = await adapter.send(chat_id, message_text, metadata=_non_conversational_metadata(send_meta, platform=platform_name))
+                    if result.success is True:
+                        watcher["delivery"].update(status="DELIVERED", message_id=result.message_id)
+                        break
+                    if result.retryable is not True or attempt == 2:
+                        break
+                    await asyncio.sleep(result.retry_after if result.retry_after is not None else 2 ** (attempt + 1))
+            except Exception as exc:
+                from gateway.run import _redact_gateway_user_facing_secrets
+                logger.error("Watcher delivery error: %s", _redact_gateway_user_facing_secrets(str(exc)))
+        if watcher["delivery"]["status"] != "DELIVERED":
+            logger.error("Process notification delivery failed (platform=%s)", platform_name)
 
     @staticmethod
     def _build_process_completion_event(watcher: dict, session, session_id: str) -> dict:

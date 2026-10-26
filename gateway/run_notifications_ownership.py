@@ -90,6 +90,39 @@ class GatewayNotificationOwnershipMixin:
             return ""
         return target
 
+    @staticmethod
+    async def _gateway_resume_promotion(session_db: Any, session_id: str, config: dict) -> str:
+        """``owner`` when an authorized /resume promoted this delegate row, ``retry`` on lookup
+        failure, else ``""`` (keep following ``_delegate_from``)."""
+        promotion = config.get("_gateway_resume")
+        if not (isinstance(promotion, dict)
+                and promotion.get("delegate_from") == config.get("_delegate_from")
+                and isinstance(promotion.get("session_id"), str) and promotion["session_id"]):
+            return ""
+        promoted_id = promotion["session_id"]
+        if promoted_id == session_id:
+            return "owner"
+        try:
+            lineage = await session_db.get_compression_lineage(session_id)
+            anchor = (await session_db.get_session(promoted_id)
+                      if promoted_id in lineage and session_id in lineage
+                      and lineage.index(promoted_id) < lineage.index(session_id)
+                      else None)
+        except Exception:
+            logger.debug("Gateway-resume promotion lookup failed for %s", session_id, exc_info=True)
+            return "retry"
+        anchor_config = (anchor or {}).get("model_config") or {}
+        if isinstance(anchor_config, str):
+            try:
+                anchor_config = json.loads(anchor_config)
+            except ValueError:
+                return ""
+        if (isinstance(anchor_config, dict)
+                and anchor_config.get("_gateway_resume") == promotion
+                and anchor_config.get("_delegate_from") == config.get("_delegate_from")):
+            return "owner"
+        return ""
+
     async def _lookup_completion_owner(self, session_id: str, current_session_id: str = ""):
         """Nonmutating delegation proof shared by preflight and route resolution.
 
@@ -135,6 +168,15 @@ class GatewayNotificationOwnershipMixin:
             parent = config["_delegate_from"]
             if not isinstance(parent, str) or not parent.strip() or hops == _MAX_DELEGATE_PROVENANCE_HOPS:
                 return "terminal", session_id, None
+            # Dize: an explicit gateway /resume promotes a delegate transcript to a route owner
+            # (``model_config._gateway_resume``, written only by the authorized command). Compression
+            # copies model_config, so a copy is honoured only when the native lineage AND the
+            # persisted anchor both confirm it; ordinary delegates/branches never inherit authority.
+            promoted = await self._gateway_resume_promotion(session_db, session_id, config)
+            if promoted == "retry":
+                return "retry", session_id, None
+            if promoted == "owner":
+                return "deliver", session_id, row
             session_id = parent
         return "terminal", session_id, None
 

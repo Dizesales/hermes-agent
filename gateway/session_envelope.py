@@ -34,6 +34,12 @@ _WHATSAPP_NATIVE_KEYS = frozenset({'video', 'audio', 'sticker', 'location', 'con
                                    'reaction', 'poll', 'pollUpdate'})
 _WHATSAPP_NATIVE_MAX_BYTES = 16 * 1024
 _MEDIA_FIELDS = ('media_urls', 'media_types', 'media_text_inlined')
+# Dize: the Hefesto execution-control plugin stamps Telegram media references on the inbound event
+# before admission (document/photo/album file refs, the photo-burst batch key, recovered documents);
+# its turn reads them back, so they cross native admission as plain JSON under a closed key set.
+_DIZE_TELEGRAM_METADATA = frozenset({'hefesto_telegram_document', 'hefesto_telegram_media',
+                                     'hefesto_native_batch', 'hefesto_recover_documents'})
+_DIZE_TELEGRAM_METADATA_MAX_BYTES = 64 * 1024
 
 
 def _native_metadata(event):
@@ -42,6 +48,13 @@ def _native_metadata(event):
     metadata = event.metadata
     if not metadata:
         return {}
+    if (isinstance(metadata, dict) and event.source.platform.value == 'telegram'
+            and set(metadata) <= _DIZE_TELEGRAM_METADATA):
+        try:
+            encoded = json.dumps(metadata, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError):
+            return None
+        return json.loads(encoded) if len(encoded.encode()) <= _DIZE_TELEGRAM_METADATA_MAX_BYTES else None
     if (not isinstance(metadata, dict) or event.source.platform.value != 'whatsapp'
             or not set(metadata) <= _WHATSAPP_METADATA):
         return None
@@ -294,9 +307,11 @@ def restore_native(payload, runner=None):
             event._heartbeat_session_id = envelope['automation']['heartbeat']
         event.metadata = {'gateway_session_key': envelope['route'],
                           'gateway_session_id': envelope['automation']['owner']}
-        from gateway.session_automation import automation_display_metadata, automation_notification_metadata
+        from gateway.session_automation import (automation_display_metadata, automation_notification_metadata,
+                                                dize_delegation_metadata)
         event.metadata.update(automation_notification_metadata(envelope['automation']))
         event.metadata.update(automation_display_metadata(envelope['automation']))
+        event.metadata.update(dize_delegation_metadata(envelope['automation']))
     return event
 
 
