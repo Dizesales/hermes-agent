@@ -660,6 +660,21 @@ def finalize_turn(
             turn_id=turn_id, original_user_message=original_user_message, messages=messages,
         )
 
+    # Delivery footers and output hooks can still change the persisted answer.
+    if final_response and not interrupted and str(_turn_exit_reason) != "empty_response_exhausted":
+        try:
+            tail = messages[-1] if messages else None
+            if not isinstance(tail, dict) or tail.get("role") != "assistant":
+                messages.append({"role": "assistant", "content": final_response})
+                agent._persist_session(messages, conversation_history)
+            elif tail.get("content") != final_response:
+                tail["content"] = final_response
+                tail.pop("_db_persisted", None)
+                agent._persist_session(messages, conversation_history)
+        except Exception as exc:
+            _cleanup_errors.append(f"persist_final_response: {exc}")
+            logger.error("Durable final-response sync failed", exc_info=True)
+
     # Context engine observation hook: the turn finished with the finalized transcript.
     # Fail-open. ``_last_turn_usage`` is the last response's canonical usage dict, or
     # ``None`` on turns that never reached a provider response — by contract.

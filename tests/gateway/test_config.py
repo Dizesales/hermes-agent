@@ -1589,6 +1589,32 @@ class TestWebhookEnvOverride:
         )
 
 
+def test_bridges_discord_dm_allow_from_without_replacing_group_users(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "discord:\n"
+        "  allow_from: [\"111\", \"222\"]\n"
+        "  dm_allow_from: [\"111\"]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("DISCORD_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("DISCORD_DM_ALLOWED_USERS", raising=False)
+
+    config = load_gateway_config()
+
+    # v0.20 normalizes Discord profile gates to CSV strings in
+    # ``PlatformConfig.extra`` so each adapter can consume a profile-local
+    # snapshot without falling back to process-global environment state.
+    assert config.platforms[Platform.DISCORD].extra["allow_from"] == "111,222"
+    assert config.platforms[Platform.DISCORD].extra["dm_allow_from"] == "111"
+    assert os.environ["DISCORD_ALLOWED_USERS"] == "111,222"
+    assert os.environ["DISCORD_DM_ALLOWED_USERS"] == "111"
+
+
 class TestOnAllAdaptersDown:
     """gateway.on_all_adapters_down: what the runner does when the last messaging
     adapter goes down (#118080). Default 'exit' preserves the service-restart

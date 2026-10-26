@@ -599,7 +599,8 @@ def _clean_discord_id(entry: str) -> str:
 # — and their discord.py event tasks are created — inside _profile_runtime_scope, so the contextvar
 # propagates) and falls back to os.getenv only outside multiplex.
 _GATE_ENV_KEYS = (
-    "DISCORD_ALLOWED_USERS", "DISCORD_ALLOWED_ROLES", "DISCORD_ALLOWED_CHANNELS",
+    "DISCORD_ALLOWED_USERS",
+    "DISCORD_DM_ALLOWED_USERS", "DISCORD_ALLOWED_ROLES", "DISCORD_ALLOWED_CHANNELS",
     "DISCORD_IGNORED_CHANNELS", "DISCORD_NO_THREAD_CHANNELS", "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
     "GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS",
@@ -1459,6 +1460,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             # to the first-writer-wins process-global env bridge.
             self._snapshot_gate_env()
             self._allowed_user_ids = self._get_allowed_users()
+            dm_raw = self._gate_raw("dm_allow_from", "DISCORD_DM_ALLOWED_USERS")
+            self._dm_allowed_user_ids = None if dm_raw is None else {_clean_discord_id(x) for x in self._gate_csv_set(dm_raw) if x.strip()}
             # DISCORD_ALLOWED_ROLES: comma-separated role IDs; ANY match grants access.
             self._allowed_role_ids = self._get_allowed_roles()
             # Intents: Server Members only when usernames must be resolved — an unenabled privileged
@@ -4116,6 +4119,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         allowed_roles = getattr(self, "_allowed_role_ids", set())
         has_users = bool(allowed_users)
         has_roles = bool(allowed_roles)
+        dm_allowed = getattr(self, "_dm_allowed_user_ids", None)
+        if is_dm and dm_allowed is not None and "*" not in dm_allowed and user_id not in dm_allowed:
+            return False
+
         # Pairing is a first-class grant in the gateway auth union; honor it here too.
         if self._is_pairing_approved_user(user_id):
             return True
@@ -7310,6 +7317,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         _env_default(env_key, text)
 
     _gate("allow_from", "DISCORD_ALLOWED_USERS", from_platform_extra=True)
+    _gate("dm_allow_from", "DISCORD_DM_ALLOWED_USERS", from_platform_extra=True)
     _gate("allowed_roles", "DISCORD_ALLOWED_ROLES", from_platform_extra=True)
     _gate("allow_all_users", "DISCORD_ALLOW_ALL_USERS", from_platform_extra=True, lower=True)
     _gate("allow_bots", "DISCORD_ALLOW_BOTS", from_platform_extra=True, lower=True)

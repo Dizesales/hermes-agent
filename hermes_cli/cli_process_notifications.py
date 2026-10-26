@@ -4,6 +4,8 @@
 class CLIProcessNotificationsMixin:
     def _owns_process_notification(self, event: dict) -> bool:
         """Whether this session owns a delegation event (pre-compression keys resolve to their continuation; fail closed)."""
+        if event.get("type") == "async_delegation":
+            return self._owns_async_delegation_event(event)
         event_key = str(event.get("session_key") or "")
         current_key = str(getattr(self, "session_id", "") or "")
         if not event_key or not current_key:
@@ -95,3 +97,49 @@ class CLIProcessNotificationsMixin:
             user_input = (user_input.text, user_input.images) if user_input.images else user_input.text
         return user_input, is_voice_input, is_seeded_query
 
+    def _owns_async_delegation_event(self, evt: dict) -> bool:
+        """Return True only with positive proof that *evt* belongs here.
+
+        A CLI may restore durable completions before an approval-context key is
+        installed.  Never use that thread-local key as the ownership source:
+        bind to the CLI/agent session IDs and, for pre-compression dispatches,
+        the canonical compression lineage in SessionDB.  Missing identity,
+        foreign sessions, DB failures, branches, and subagent parent links all
+        fail closed.
+        """
+        if not isinstance(evt, dict) or evt.get("type") != "async_delegation":
+            return False
+
+        current_ids = {
+            str(value).strip()
+            for value in (
+                getattr(self, "session_id", ""),
+                getattr(getattr(self, "agent", None), "session_id", ""),
+            )
+            if str(value or "").strip()
+        }
+        event_ids = {
+            str(value).strip()
+            for value in (
+                evt.get("session_key"),
+                evt.get("parent_session_id"),
+            )
+            if str(value or "").strip()
+        }
+        if not current_ids or not event_ids:
+            return False
+        if current_ids.intersection(event_ids):
+            return True
+
+        session_db = getattr(self, "_session_db", None)
+        lineage_check = getattr(session_db, "is_compression_ancestor", None)
+        if not callable(lineage_check):
+            return False
+        try:
+            return any(
+                lineage_check(event_id, current_id)
+                for event_id in event_ids
+                for current_id in current_ids
+            )
+        except Exception:
+            return False

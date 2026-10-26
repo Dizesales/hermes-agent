@@ -1548,7 +1548,10 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
     app_server_auto, responses_native, compact_threshold = _compression_codex_settings(cfg)
     # Opt-in idle compaction: compact up front when a session resumes after this many
     # seconds idle (0 = disabled). Consumed by build_turn_context().
-    idle_compact_after_seconds = max(0, int(cfg.get("idle_compact_after_seconds", 0)))
+    raw_idle_after = cfg.get("idle_compact_after_seconds", 0)
+    idle_compact_after_seconds = 0 if isinstance(raw_idle_after, bool) else max(0, _parse_config_int(raw_idle_after, 0))
+    raw_idle_floor = cfg.get("idle_compact_floor_tokens")
+    idle_compact_floor_tokens = None if isinstance(raw_idle_floor, bool) else _positive_int(raw_idle_floor) if raw_idle_floor is not None else None
     return CompressionSettings(
         threshold=threshold,
         autoraise_notice_enabled=autoraise_notice_enabled,
@@ -1596,6 +1599,7 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         codex_responses_native=responses_native,
         codex_responses_compact_threshold=compact_threshold,
         idle_compact_after_seconds=idle_compact_after_seconds,
+        idle_compact_floor_tokens=idle_compact_floor_tokens,
     )
 
 
@@ -2049,6 +2053,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     )
     agent.max_compression_attempts = cs.max_attempts
     agent.compression_idle_compact_after_seconds = cs.idle_compact_after_seconds
+    agent.compression_idle_compact_floor_tokens = cs.idle_compact_floor_tokens
 
 
 def _enforce_minimum_context(agent):

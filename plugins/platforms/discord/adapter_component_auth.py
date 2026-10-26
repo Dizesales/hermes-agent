@@ -25,6 +25,12 @@ def _component_check_auth(
     # Scope-aware reads (issue #72348): component interactions are dispatched from discord.py tasks
     # descended from the task created inside the owning profile's runtime scope, so the profile's
     # secret-scope contextvar is inherited here.
+    # Dize: DISCORD_DM_ALLOWED_USERS narrows who may click components in DMs, ahead of every grant.
+    dm_raw = _scoped_gate_env("DISCORD_DM_ALLOWED_USERS")
+    if getattr(interaction, "guild", None) is None and dm_raw:
+        dm_allowed = {x.strip() for x in dm_raw.split(",") if x.strip()}
+        if "*" not in dm_allowed and str(user.id) not in dm_allowed:
+            return False
     if _scoped_gate_env("DISCORD_ALLOW_ALL_USERS").strip().lower() in {"true", "1", "yes"}:
         return True
     if _scoped_gate_env("GATEWAY_ALLOW_ALL_USERS").strip().lower() in {"true", "1", "yes"}:

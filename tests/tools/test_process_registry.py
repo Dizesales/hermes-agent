@@ -3006,6 +3006,36 @@ class TestGetByPrefix:
         assert result["status"] == "running"
 
 
+def test_drain_notifications_no_filter_requeues_async_delegation_fail_closed():
+    from tools.process_registry import process_registry
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+    try:
+        for delegation_id, session_key in (
+            ("deleg_1", "session_a"),
+            ("deleg_2", "session_b"),
+        ):
+            process_registry.completion_queue.put({
+                "type": "async_delegation",
+                "delegation_id": delegation_id,
+                "session_key": session_key,
+                "status": "completed",
+                "summary": "done",
+                "duration_seconds": 0.3,
+            })
+
+        assert process_registry.drain_notifications() == []
+        ids = {
+            process_registry.completion_queue.get_nowait()["delegation_id"],
+            process_registry.completion_queue.get_nowait()["delegation_id"],
+        }
+        assert ids == {"deleg_1", "deleg_2"}
+    finally:
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
 # ---------------------------------------------------------------------------
 # Config-level model_not_found notice in delegation batch reports (#97654)
 # ---------------------------------------------------------------------------

@@ -576,6 +576,37 @@ def _unreadable_reason(path: Path) -> str:
     return f"`{path}` is larger than the scan cap ({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget"
 
 
+# How much of an oversized script the NUL probe reads before accepting it as plain text.
+_OVERSIZED_NUL_PROBE_BYTES = 8 * 1024 * 1024
+
+
+def _has_nul_padded_text(path: Path, limit: int = _OVERSIZED_NUL_PROBE_BYTES) -> bool:
+    """True when the first *limit* bytes of *path* mix NUL padding with real content (bash executes
+    straight past embedded NULs), or when it cannot be read. A NUL-only blob is not a script."""
+    has_nul = has_text = False
+    try:
+        with open(path, "rb") as handle:
+            remaining = limit
+            while remaining > 0 and not (has_nul and has_text):
+                chunk = handle.read(min(remaining, 1024 * 1024))
+                if not chunk:
+                    break
+                has_nul = has_nul or b"\x00" in chunk
+                has_text = has_text or bool(chunk.translate(None, b"\x00 \t\r\n"))
+                remaining -= len(chunk)
+    except (OSError, ValueError):
+        return True
+    return has_nul and has_text
+
+
+def _is_size_only_refusal(reason: str, path: Optional[Path] = None) -> bool:
+    """Hefesto: a large regular file is not a lifecycle risk by itself. Text padded with NULs to
+    look like a blob keeps failing closed."""
+    if "is larger than the scan cap" not in reason:
+        return False
+    return path is None or not _has_nul_padded_text(path)
+
+
 def _refuse_unreadable(budget: _LifecycleScanBudget, path: Path, reason: str) -> bool:
     logger.warning("lifecycle guard cannot scan referenced script %s: %s; failing closed", path, reason)
     budget.refusal = reason
@@ -1152,8 +1183,11 @@ def _contains_unsafe_gateway_action(
         # remainder fails closed exactly like an oversized one.
         script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
         if unsafe:
+            reason = _unreadable_reason(script_path)
+            if candidate_executed and not _is_size_only_refusal(reason, script_path):
+                return _refuse_unreadable(budget, script_path, reason)
             if candidate_executed:
-                return _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
+                logger.warning("lifecycle guard skipped oversized script %s: %s", script_path, reason)
             continue
         if script_text is None and read_remote_script is not None:
             # Local path missing; the remote backend's output crosses the same trust boundary as a
@@ -1167,11 +1201,7 @@ def _contains_unsafe_gateway_action(
             )
             if unsafe:
                 if candidate_executed:
-                    return _refuse_unreadable(
-                        budget, script_path,
-                        f"`{script_path}` read from the backend exceeds the scan cap "
-                        f"({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget",
-                    )
+                    logger.warning("lifecycle guard skipped oversized remote script %s", script_path)
                 continue
         if not script_text:
             continue

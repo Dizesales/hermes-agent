@@ -48,6 +48,7 @@ import {
   inboundReadReceiptKeys,
   inferMediaType,
   mediaPayloadForFile,
+  normalizeWhatsAppLookupCandidates,
   normalizeWhatsAppId,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
@@ -471,6 +472,7 @@ async function startSocket() {
 
   sock.ev.on('messages.update', async (updates) => {
     for (const { key, update } of updates || []) {
+      recentlySentIds.observe('messages.update', { key, update });
       if (!update?.pollUpdates) continue;
       const pollCreationId = key?.id || update.pollUpdates?.[0]?.pollCreationMessageKey?.id;
       const pollCreation = messageStore.get(pollCreationId);
@@ -517,6 +519,12 @@ async function startSocket() {
         aggregation,
       });
       enqueuePollUpdateEvent({ key, update: { ...update, pollUpdates }, selectedOptions, aggregation });
+    }
+  });
+
+  sock.ev.on('message-receipt.update', (updates) => {
+    for (const receipt of Array.isArray(updates) ? updates : [updates]) {
+      recentlySentIds.observe('message-receipt.update', receipt);
     }
   });
 
@@ -837,6 +845,28 @@ app.get('/messages', (req, res) => {
   res.json(msgs);
 });
 
+app.post('/resolve-whatsapp', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const candidates = normalizeWhatsAppLookupCandidates(req.body?.candidates);
+  if (candidates.length === 0) {
+    return res.status(400).json({ error: 'at least one valid candidate is required' });
+  }
+  try {
+    const matches = [];
+    for (const candidate of candidates) {
+      for (const entry of await sock.onWhatsApp(candidate) || []) {
+        const jid = normalizeWhatsAppId(entry?.jid || '');
+        if (entry?.exists && /^\d{8,15}@s\.whatsapp\.net$/.test(jid)) matches.push(jid);
+      }
+    }
+    return res.json({ matches: [...new Set(matches)] });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // Send a message
 app.post('/send', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
@@ -875,6 +905,15 @@ app.post('/send', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+app.post('/delivery-status', async (req, res) => {
+  const messageId = String(req.body?.messageId || '').trim();
+  if (!messageId || messageId.length > 256) {
+    return res.status(400).json({ error: 'valid messageId is required' });
+  }
+  const waitMs = Math.min(30000, Math.max(0, Number(req.body?.waitMs) || 0));
+  return res.json(await recentlySentIds.waitFor(messageId, waitMs));
 });
 
 // Edit a previously sent message

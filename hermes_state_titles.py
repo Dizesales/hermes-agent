@@ -223,6 +223,12 @@ class SessionTitlesMixin:
         """Next title in a lineage ("my session" -> "my session #2")."""
         return self._read_retrying_ioerr(lambda conn: next_title_in_lineage(conn, base_title))
 
+    def is_compression_ancestor(self, ancestor_id: str, descendant_id: str) -> bool:
+        """Prove a compression-continuation relationship without mutation (Dize: async delegation
+        ownership checks in ``hermes_cli/cli_process_notifications.py``)."""
+        return self._read_retrying_ioerr(lambda conn: self._is_compression_ancestor(
+            conn, ancestor_id=str(ancestor_id or ""), descendant_id=str(descendant_id or "")))
+
 
 def lineage_title_on_conn(conn, base_title: str) -> str:
     """``get_next_title_in_lineage`` inside an authority-owned transaction (same connection, so a

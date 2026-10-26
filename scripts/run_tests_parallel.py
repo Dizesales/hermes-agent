@@ -643,6 +643,9 @@ def _run_one_file_once(
     env = os.environ.copy()
     temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
+    # Dize: never inherit a caller's HERMES_HOME (a gateway shell exports the live one); with it unset,
+    # tests/conftest.py sandboxes a throwaway home per file and removes it at exit.
+    env.pop("HERMES_HOME", None)
     # Every tempfile.* call inside the test process lands in the same per-run root, so the
     # parent's cleanup of ``temproot`` removes them too instead of leaving them in /tmp.
     env["TMPDIR"] = temproot

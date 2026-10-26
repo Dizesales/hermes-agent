@@ -114,15 +114,13 @@ def test_resolved_default_is_written_once_and_never_on_a_guard(s6_host):
     text = (root / "config.yaml").read_text(encoding="utf-8")
     assert "# my config" in text and "multiplex_profiles: true" in text  # comment-preserving writer
     assert mode.persist_resolved_default(on, root) is False  # already explicit: once
-    # A retired ``false`` is rewritten in place, never silently: the one-time notice reaches the
-    # gateway start (log_multiplex_decision prints it) and the next ``hermes update`` summary.
+    # Dize: an explicit ``false`` is not retired — it keeps the default gateway single-profile
+    # (decision source "config") and the file is never rewritten, so no rewrite notice is queued.
     (root / "config.yaml").write_text("# my config\ngateway:\n  multiplex_profiles: false\n", encoding="utf-8")
     from gateway.config import GatewayConfig
     decision = mode.resolve_multiplex_mode(GatewayConfig.from_dict({"gateway": {"multiplex_profiles": False}}))
-    assert decision.source == "retired-opt-out"
+    assert decision.source == "config" and decision.enabled is False
     mode.log_multiplex_decision(decision)
     text = (root / "config.yaml").read_text(encoding="utf-8")
-    assert "# my config" in text and "multiplex_profiles: true" in text and "false" not in text
-    notice = mode.consume_rewritten_notice(root)
-    assert any("rewritten to true" in line for line in notice) and notice[0].startswith("┌")
-    assert mode.consume_rewritten_notice(root) == []  # one-time
+    assert "# my config" in text and "multiplex_profiles: false" in text and "true" not in text
+    assert mode.consume_rewritten_notice(root) == []

@@ -832,6 +832,9 @@ def _profile_skill_sync_status(r) -> str:
 
 def _sync_profiles_after_update() -> None:
     """Best-effort per-profile syncs: bundled skills, ``.env`` backfill, Honcho profiles."""
+    if not _sync_named_profiles_on_update_enabled():
+        print("Named-profile sync skipped (updates.sync_named_profiles=false)")
+        return
     # All profiles incl. the active one: seed_profile_skills() subprocesses with an explicit
     # HERMES_HOME, so sync_skills()'s module-level HERMES_HOME cache can't skew it.
     with suppress(Exception):
@@ -1069,3 +1072,35 @@ def _run_post_update_maintenance(
         record_followup("sqlite_runtime", "the selected Python links an unsafe SQLite runtime",
                         retry="run the installer again")
     return update_complete
+
+
+def _sync_named_profiles_on_update_enabled() -> bool:
+    """Whether an update may mutate named profiles on this host.
+
+    Upstream defaults to syncing bundled skills and backfilling credentials
+    across every local profile.  Fleet-owner hosts can keep named profiles as
+    read-only projections of runtimes owned elsewhere, so they need an
+    explicit host-local off switch.  Fail open to the upstream default when
+    config cannot be read; only an explicit false value narrows the update.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+        updates = config.get("updates", {})
+        if not isinstance(updates, dict):
+            return True
+        raw = updates.get("sync_named_profiles", True)
+    except Exception as exc:
+        logger.debug("Could not read updates.sync_named_profiles: %s", exc)
+        return True
+
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in {"false", "no", "off", "0"}:
+            return False
+        if normalized in {"true", "yes", "on", "1"}:
+            return True
+    return True

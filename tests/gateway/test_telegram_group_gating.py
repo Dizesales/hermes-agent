@@ -1012,3 +1012,27 @@ def test_sibling_bot_explicit_mention_still_dispatches_and_is_not_observed():
     human = _group_message("hermes, hello")
     assert adapter._should_process_message(human) is True
     assert adapter._should_observe_unmentioned_group_message(human) is False
+
+
+def test_config_preserves_telegram_dm_allow_from_separately(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "telegram:\n"
+        "  allow_from: [\"111\", \"222\"]\n"
+        "  dm_allow_from: [\"111\"]\n"
+        "  group_allow_from: [\"111\", \"222\"]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("TELEGRAM_DM_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("TELEGRAM_GROUP_ALLOWED_USERS", raising=False)
+
+    config = load_gateway_config()
+
+    telegram = config.platforms[Platform.TELEGRAM]
+    assert telegram.extra["allow_from"] == ["111", "222"]
+    assert telegram.extra["dm_allow_from"] == ["111"]
+    assert __import__("os").environ["TELEGRAM_ALLOWED_USERS"] == "111,222"
+    assert "TELEGRAM_DM_ALLOWED_USERS" not in __import__("os").environ

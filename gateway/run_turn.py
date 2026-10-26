@@ -196,6 +196,29 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         except Exception:
             return False
 
+    @staticmethod
+    def _event_observer_context(event, source, session_key):
+        """Trusted event identity for observers; never derive it from message text.
+
+        External messages have no internal correlation metadata. Only the small
+        allowlist travels to the turn, outside the prompt, and queued turns build
+        their own context instead of inheriting the previous event.
+        """
+        if not bool(getattr(event, "internal", False)):
+            return {}
+        from copy import deepcopy
+        metadata = getattr(event, "metadata", None) or {}
+        names = ("dize_delegation", "async_delegation_ids",
+                 "async_delegation_interim", "gateway_session_id")
+        selected = {name: deepcopy(metadata[name]) for name in names if name in metadata}
+        if not selected:
+            return {}
+        platform = getattr(source.platform, "value", source.platform)
+        return {"internal": True, "session_key": session_key,
+                "source": {"platform": str(platform), "chat_id": str(source.chat_id or ""),
+                           "thread_id": str(source.thread_id or ""), "user_id": str(source.user_id or "")},
+                "metadata": selected}
+
 
 
 
@@ -280,6 +303,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                gateway_event_context=self._event_observer_context(event, source, session_key),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -1974,6 +1998,8 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 persist_user_display_metadata={
                     **display_metadata_for_event(pending_event),
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
+                gateway_event_context=self._event_observer_context(
+                    pending_event, next_source, next_session_key) if pending_event is not None else {},
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -2302,6 +2328,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        gateway_event_context: Optional[dict] = None,
     ) -> dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -2348,6 +2375,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
+            gateway_event_context=gateway_event_context,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,

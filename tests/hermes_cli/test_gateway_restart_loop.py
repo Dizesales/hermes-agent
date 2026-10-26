@@ -1242,7 +1242,9 @@ class TestLifecycleGuardModule:
             cwd="/tmp",
             read_remote_script=lambda _path: big,
         )
-        assert result is True
+        # Dize (Hefesto hotfix): oversized remote text is logged and skipped, not refused, the same
+        # as an oversized local text file.
+        assert result is False
 
     def test_guard_is_total_against_adversarial_inputs(self, monkeypatch):
         """The public guard is a total function: no input may raise. Covers

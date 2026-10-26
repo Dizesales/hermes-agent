@@ -67,6 +67,24 @@ class TestConfigEnvOverrides(unittest.TestCase):
         self.assertEqual(config.platforms[Platform.FEISHU].extra["app_id"], "cli_xxx")
         self.assertEqual(config.platforms[Platform.FEISHU].extra["connection_mode"], "websocket")
 
+
+class TestHermeticStateHome(unittest.TestCase):
+    @patch.dict(os.environ, {}, clear=True)
+    def test_cleared_environment_cannot_write_live_feishu_state(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        isolated_home = adapter._dedup_state_path.parent.resolve()
+        live_home = (Path.home() / ".hermes").resolve()
+
+        self.assertNotEqual(isolated_home, live_home)
+        adapter._mark_connected()
+        adapter._persist_seen_message_ids()
+        self.assertTrue((isolated_home / "gateway_state.json").exists())
+        self.assertTrue(adapter._dedup_state_path.exists())
+
+
 class TestFeishuMessageNormalization(unittest.TestCase):
 
     def test_normalize_interactive_card_preserves_title_body_and_actions(self):

@@ -136,7 +136,11 @@ def native_compaction_context_management(agent: Any, *, is_codex_backend: bool, 
 
     compressor = getattr(agent, "context_compressor", None)
     local_trigger = getattr(compressor, "threshold_tokens", None) if compressor is not None else None
-    threshold = resolve_compact_threshold(getattr(agent, "codex_responses_compact_threshold", None), local_trigger)
+    configured = getattr(agent, "codex_responses_compact_threshold", None)
+    idle_threshold = getattr(agent, "_codex_responses_idle_compact_threshold_for_turn", None)
+    if type(idle_threshold) is int and idle_threshold > 0:
+        configured = min(configured, idle_threshold) if type(configured) is int and configured > 0 else idle_threshold
+    threshold = resolve_compact_threshold(configured, local_trigger)
     return [{"type": "compaction", "compact_threshold": threshold}]
 
 
@@ -419,3 +423,38 @@ def merge_interim_reasoning_items(prior_items: Any, new_items: Any) -> list[dict
     if has_compaction_checkpoint(new_list) or not kept_checkpoints:
         return new_list
     return kept_checkpoints + new_list
+
+
+def native_compaction_eligible_for_agent(agent: Any) -> bool:
+    """Return whether this agent can safely use Responses native compaction.
+
+    This is the turn-prologue counterpart of
+    :func:`native_compaction_context_management`. It derives the endpoint
+    flags from the live agent so the idle path can prefer a server-side
+    checkpoint over Hermes' lossy local summary without duplicating a looser
+    eligibility policy.
+    """
+    if getattr(agent, "api_mode", None) != "codex_responses":
+        return False
+    provider = str(getattr(agent, "provider", "") or "").lower()
+    base_url = str(getattr(agent, "base_url", "") or "")
+    try:
+        parsed = urlsplit(base_url)
+        hostname = (parsed.hostname or "").lower()
+        path = (parsed.path or "").lower()
+    except ValueError:
+        hostname = ""
+        path = ""
+    is_codex_backend = provider == "openai-codex" or (
+        hostname == "chatgpt.com" and "/backend-api/codex" in path
+    )
+    is_xai_responses = provider in {"xai", "xai-oauth"} or hostname == "api.x.ai"
+    is_github_responses = (
+        hostname == "models.github.ai" or hostname.endswith("githubcopilot.com")
+    )
+    return native_compaction_context_management(
+        agent,
+        is_codex_backend=is_codex_backend,
+        is_xai_responses=is_xai_responses,
+        is_github_responses=is_github_responses,
+    ) is not None

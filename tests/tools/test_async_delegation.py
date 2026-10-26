@@ -825,6 +825,31 @@ def test_batch_truncation_banner_marks_only_truncated_task():
     assert banner_pos > clean_pos
 
 
+def test_reset_for_tests_prevents_late_completion_queue_writes():
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "late"}
+
+    ad.dispatch_async_delegation(
+        goal="late worker", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=runner, max_async_children=1,
+    )
+    timer = threading.Timer(0.05, gate.set)
+    timer.start()
+    try:
+        ad._reset_for_tests()
+    finally:
+        timer.cancel()
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+    time.sleep(0.1)
+
+    assert process_registry.completion_queue.empty()
+
+
 def _patch_delegation_cfg(monkeypatch, model="upstage/solar-pro-4", provider="openrouter"):
     """Pin the delegation config the notice renderer reads (adapts the
     #97667 tests to the shipped implementation, which reads the configured

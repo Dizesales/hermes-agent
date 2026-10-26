@@ -937,7 +937,7 @@ class TestSessionRetirement:
         s = make_session(client)
         # Clock: deadline arm, tool item at 999.0, then every later poll sits
         # well past the 0.15s quiet threshold until turn/completed is drained.
-        monotonic_values = itertools.chain([1000.0, 999.0, 999.0, 999.0], itertools.repeat(1000.2))
+        monotonic_values = itertools.chain([999.0] * 6, itertools.repeat(1000.2))
         with caplog.at_level(logging.WARNING, logger=session_mod.logger.name), patch.object(
             session_mod.time,
             "monotonic",
@@ -1205,6 +1205,34 @@ class TestTransportLoss:
         assert steer_session.request_steer("more") is False
         control.fail_on = "turn/interrupt"
         steer_session._issue_interrupt("turn-fake-001")  # must not raise
+
+
+def test_optional_deadline_keeps_active_tool_alive_past_inactivity(monkeypatch):
+    client = FakeClient()
+    client.queue_notification('item/started', item={'id': 'quiet-tool', 'type': 'commandExecution', 'command': 'test'}, threadId='t', turnId='tu1')
+    client.queue_notification('item/completed', item={'id': 'quiet-tool', 'type': 'commandExecution', 'command': 'test', 'status': 'completed', 'exitCode': 0}, threadId='t', turnId='tu1')
+    client.queue_notification('turn/completed', threadId='t', turn={'id': 'tu1', 'status': 'completed'})
+    now = [100.0]
+    take = client.take_notification
+    def delayed(timeout=0):
+        note = take(timeout)
+        if note and note['method'] == 'item/completed':
+            now[0] += 120
+        return note
+    client.take_notification = delayed
+    monkeypatch.setattr(session_mod.time, 'monotonic', lambda: now[0])
+    result = make_session(client).run_turn('test', turn_timeout=None, inactivity_timeout=30, notification_poll_timeout=0)
+    assert result.error is None
+    assert not result.interrupted
+    assert not result.should_retire
+
+
+def test_inactivity_still_interrupts_without_total_deadline():
+    client = FakeClient()
+    result = make_session(client).run_turn('test', turn_timeout=None, inactivity_timeout=0.01, notification_poll_timeout=0.001)
+    assert result.interrupted and result.should_retire
+    assert 'inactive' in result.error
+    assert any(method == 'turn/interrupt' for method, _ in client.requests)
 
 
 def test_only_current_turn_progress_reaches_hermes_activity_clock():

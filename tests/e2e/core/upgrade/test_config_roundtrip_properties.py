@@ -299,6 +299,11 @@ def gen_case(seed: int, *, long: bool = False, n_sections: tuple = (5, 11), excl
         if isinstance(tree["skills"], dict):
             tree["skills"]["external_dirs"] = [f"/opt/c18/{rng.choice(_WORDS)}", rng.choice(_UNICODE)]
     tree["_config_version"] = LATEST
+    # Adding a documented section changes seeded sampling. Null-coverage cases must
+    # keep a real null leaf regardless of the number/order of configuration keys.
+    if null_leaves and not any(_get(tree, path) is None for path in _leaves(tree)):
+        path = next(path for path in _leaves(tree) if path[0] in sections)
+        _set(tree, path, None)
 
     lines: list[str] = [f"# C18 generated config (seed={seed}) — comments must survive every write"]
     leaf_lines: dict[tuple, int] = {}
@@ -937,8 +942,11 @@ def test_p3_a_transient_error_on_any_single_read_never_clobbers(op_name, web_app
 
 
 def _truncate_mid_scalar(text: str) -> str:
-    idx = text.index('"', text.index("\n", 10))  # first double-quoted scalar after the header
-    return text[: idx + 5]
+    # Dize: cut right after the opening quote of the first double-quoted scalar after the header,
+    # never after its closing quote (Dize's extra default keys shift the seeded sampling, and a short
+    # scalar made upstream's fixed five-character cut valid YAML). ``hermes_yaml`` has no ``scan``.
+    idx = text.index('"', text.index("\n", 10))
+    return text[: idx + 1]
 
 
 _PERSISTENT_FAULTS = {

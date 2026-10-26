@@ -589,6 +589,7 @@ DEFAULT_CONFIG = {
     },
 
     "compression": {
+        "idle_compact_floor_tokens": None,
         "enabled": True,
         # checkpoint_required: fail closed before lossy compaction unless an active memory provider
         # confirms checkpoint API compatibility and completes the checkpoint.
@@ -1460,6 +1461,7 @@ DEFAULT_CONFIG = {
     # Skills — external skill directories shared across tools/agents. Paths are expanded (~, ${VAR})
     # and resolved; read-only — creation goes to ~/.hermes/skills/ unless create_dir redirects it.
     "skills": {
+        "selection_policy": "broad",
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
         # Where skill_manage-created skills go (empty = profile-local dir). When set, new skills
         # land here AND agent-facing instructions name this path; expanded (~, ${VAR}), relative to
@@ -2357,6 +2359,7 @@ DEFAULT_CONFIG = {
     },
 
     "updates": {
+        "sync_named_profiles": True,
         # Passive version/banner checks only; explicit `hermes update --check` remains enabled.
         "check": True,
         # Pre-update backup. quick = snapshot small critical state (pairing JSONs, cron jobs,

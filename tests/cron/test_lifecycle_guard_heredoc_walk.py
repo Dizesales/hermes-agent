@@ -38,9 +38,9 @@ def test_allowlisted_name_function_heredoc_stays_visible(tmp_path):
 
 
 def test_unquoted_heredoc_body_path_still_walked(tmp_path):
-    """An expansion-capable body is not provably inert: the walk still sees it and fails closed."""
+    """Hefesto: the walk still sees the body, but a large benign file is skipped, not refused."""
     big = _big_file(tmp_path)
-    assert guard(f"cat > /tmp/x <<EOF\n{big}\nEOF", cwd=str(tmp_path)) is True
+    assert guard(f"cat > /tmp/x <<EOF\n{big}\nEOF", cwd=str(tmp_path)) is False
 
 
 def test_inert_heredoc_body_script_path_still_read(tmp_path):

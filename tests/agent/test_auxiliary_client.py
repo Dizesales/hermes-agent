@@ -669,8 +669,12 @@ class TestAnthropicOAuthFlag:
             def has_credentials(self):
                 return True
 
-            def select(self):
+            # Dize: the native Anthropic path selects per model and checks the token's cooldown.
+            def select(self, *, model=None):
                 return _Entry()
+
+            def token_is_blocked(self, token, *, model=None):
+                return False
 
         with (
             patch("agent.auxiliary_client.load_pool", return_value=_Pool()),

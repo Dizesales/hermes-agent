@@ -123,7 +123,7 @@ def test_standalone_launcher_never_multiplexes_other_profiles(fleet, flag):
             assert decision.enabled is True
 
 
-def test_explicit_true_is_never_second_guessed_and_explicit_false_is_retired(fleet, monkeypatch):
+def test_explicit_profile_selection_is_preserved(fleet, monkeypatch):
     root, _services, pids = fleet
     pids["coder"] = 4101
     (root / "config.yaml").write_text("gateway:\n  multiplex_profiles: true\n", encoding="utf-8")
@@ -138,8 +138,8 @@ def test_explicit_true_is_never_second_guessed_and_explicit_false_is_retired(fle
     pids.clear()
     cfg = load_gateway_config()
     decision = mode.resolve_multiplex_mode(cfg)
-    assert decision.enabled is True and decision.source == "retired-opt-out"
-    assert cfg.multiplex_profiles is True
+    assert decision.enabled is False and decision.source == "config"
+    assert cfg.multiplex_profiles is False
     assert mode.explicit_multiplex_flag(root) is False
 
     # ...and it still cannot force a fold that would double-bind: a secondary that owns a live
@@ -147,7 +147,7 @@ def test_explicit_true_is_never_second_guessed_and_explicit_false_is_retired(fle
     pids["coder"] = 4101
     cfg = load_gateway_config()
     guarded = mode.resolve_multiplex_mode(cfg)
-    assert guarded.enabled is False and guarded.source == "guard" and "coder" in guarded.reason
+    assert guarded.enabled is False and guarded.source == "config"
 
 
 def test_migration_plan_treats_the_unset_default_as_not_yet_multiplexed(fleet):
@@ -189,6 +189,17 @@ def test_guard_refusal_is_recorded_in_runtime_status_and_cleared_on_default(tmp_
     assert gw_status.read_runtime_status(tmp_path / "gateway_state.json")["multiplex_standalone_reason"] is None
 
 
+def test_explicit_single_profile_never_rewrites_or_discovers_other_profiles(fleet, monkeypatch):
+    root, _, _ = fleet
+    path = root / "config.yaml"
+    path.write_text("gateway:\n  multiplex_profiles: false\n")
+    before = path.read_bytes()
+    monkeypatch.setattr(mode, "implicit_multiplex_blocker", lambda: pytest.fail("explicit selection must not inspect other profiles"))
+    decision = mode.resolve_multiplex_mode(load_gateway_config())
+    mode.log_multiplex_decision(decision)
+    assert decision.enabled is False
+    assert path.read_bytes() == before
+    assert mode.default_gateway_multiplexes(root) is False
 @pytest.mark.spawns_gateway_lookalike  # a stub that records a decision and takes the lock; reaped below
 def test_pre_lock_decision_never_publishes_a_rival_gateway_owner(tmp_path):
     """The multiplex decision is made while the config loads, before the runtime-lock claim. Writing

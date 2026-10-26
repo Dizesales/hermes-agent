@@ -445,6 +445,50 @@ def test_zero_collected_across_run_fails_and_says_so(tmp_path: Path) -> None:
     assert "NOT a pass" in proc.stdout
 
 
+def test_runner_isolates_and_removes_hermes_home(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = tmp_path / "home-probe"
+    probe_dir.mkdir()
+    handoff = tmp_path / "resolved-home.txt"
+    inherited_home = tmp_path / "must-not-be-used"
+    (probe_dir / "test_home_probe.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n\n"
+        "def test_home_is_not_inherited():\n"
+        "    home = os.environ.get('HERMES_HOME', '')\n"
+        f"    assert not home or Path(home).resolve() != Path({str(inherited_home)!r}).resolve()\n"
+        f"    Path({str(handoff)!r}).write_text(home)\n"
+    )
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(inherited_home)
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "1",
+            "--file-timeout",
+            "30",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    # Dize: the runner drops an inherited HERMES_HOME; v0.22's tests/conftest.py owns the per-file
+    # sandbox home (and removes it), so a probe outside tests/ simply sees none.
+    resolved_home = handoff.read_text()
+    assert resolved_home != str(inherited_home)
+    assert not resolved_home or not Path(resolved_home).exists()
+    assert not inherited_home.exists()
 
 
 def test_fail_on_skip_fails_a_run_with_any_skip_even_beside_an_xfail(tmp_path: Path) -> None:

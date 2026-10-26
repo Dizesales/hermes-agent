@@ -1133,6 +1133,10 @@ def _build_replay_entry(
     providers.
     """
     entry: dict[str, Any] = {"role": role, "content": content}
+    # Preserve native summary provenance through gateway replay. The selector
+    # requires this internal flag; a user quoting a summary prefix is not proof.
+    if msg.get("_compressed_summary") is True:
+        entry["_compressed_summary"] = True
     # api_content sidecar keeps the request prefix byte-stable — ONLY if this pipeline did not rewrite
     # content. The caller renders timestamps AFTER this check so a stamp alone never drops the sidecar.
     _sidecar = msg.get("api_content")
@@ -1655,6 +1659,13 @@ def _multiplex_profile_homes(config: object) -> list[tuple[str, Path]]:
     reserved = getattr(config, "_runtime_profile_homes", None)
     if reserved is not None:
         return list(reserved)
+    if getattr(config, "multiplex_profiles", None) is not True:
+        # Dize: one gateway per profile per host. Without a multiplex reservation this process
+        # serves (and ticks cron for) its launch profile only, never sibling profile dirs that
+        # belong to another host's gateway.
+        from hermes_cli.profiles import get_active_profile_name, get_profile_dir
+        active = get_active_profile_name() or "default"
+        return [(active, Path(get_profile_dir(active)))]
     from hermes_cli.profiles import profiles_to_serve
     return list(profiles_to_serve(multiplex=True))
 
@@ -4563,6 +4574,10 @@ def _start_gateway_housekeeping(
         for every, label, fn in chores:
             if tick_count % every == 0:
                 _housekeeping_chore(label, fn)
+        if tick_count % 10 == 0:
+            from hermes_cli.plugins import invoke_hook
+            _housekeeping_chore("Plugin tick", invoke_hook, "gateway_housekeeping_tick",
+                                tick_count=tick_count, interval_seconds=interval)
         wait_for_next_tick(stop_event, interval, queue_watch, _housekeeping_chore)
     logger.info("Gateway housekeeping stopped")
 

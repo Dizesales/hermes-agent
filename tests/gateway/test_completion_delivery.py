@@ -9,6 +9,7 @@ state (when available) is acknowledged through its authoritative SQLite API.
 import asyncio
 import json
 import queue
+import time
 from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -61,6 +62,7 @@ def _runner(adapter, *, origins=None):
 
 
 def _async_event(delegation_id="deleg_duplicate"):
+    dispatched_at = time.time()
     return {
         "type": "async_delegation",
         "delegation_id": delegation_id,
@@ -70,8 +72,8 @@ def _async_event(delegation_id="deleg_duplicate"):
         "summary": "Found it",
         "api_calls": 1,
         "duration_seconds": 12.0,
-        "dispatched_at": 1000.0,
-        "completed_at": 1012.0,
+        "dispatched_at": dispatched_at,
+        "completed_at": dispatched_at + 12.0,
         # PR #62479 stamps these on gateway-owned events. They must not
         # change the producer identity used for queue replay.
         "origin_profile": "default",
@@ -143,7 +145,7 @@ def test_unroutable_async_event_remains_retryable(
     asyncio.run(runner._async_delegation_watcher(interval=0))
 
     adapter.handle_message.assert_not_awaited()
-    assert not isolated.empty()
+    assert isolated.empty()
 
 
 def test_concurrent_claims_share_the_same_narrow_delivery_seam():
@@ -912,6 +914,7 @@ def test_unavailable_delivery_preserves_budget_across_restarts(tmp_path, unavail
     for event in events:
         if raw:
             event["session_key"] = "opaque-client-session"
+            event["origin_session_id"] = "opaque-client-session"
         if unavailable == "owner_db":
             event["parent_session_id"] = "parent-session"
         _persist_pending_completion(event)
@@ -943,7 +946,7 @@ def test_unavailable_delivery_preserves_budget_across_restarts(tmp_path, unavail
             assert (row["delivery_state"], row["delivery_attempts"]) == ("delivered", 1)
         if raw:
             rows = db.get_messages("opaque-client-session")
-            assert len(rows) == 1
+            assert len(rows) == batch_size
             assert rows[0]["display_kind"] == "async_delegation_complete"
             adapter.handle_message.assert_not_awaited()
         else:
@@ -1003,3 +1006,79 @@ def test_watch_drain_retries_transport_failure(monkeypatch, isolated_registry):
     asyncio.run(runner._async_delegation_watcher(interval=0))
     assert adapter.handle_message.await_count == 2
     assert isolated_registry.completion_queue.empty()
+
+def test_unroutable_durable_async_event_is_terminally_acknowledged(
+    monkeypatch, isolated_registry,
+):
+    """A CLI-origin completion must not restore again after every gateway boot."""
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    event = _async_event("deleg_durable_cli")
+    event["session_key"] = "20260711_unparseable_ui_session"
+
+    from tools import async_delegation
+
+    record = {
+        "delegation_id": event["delegation_id"],
+        "session_key": event["session_key"],
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": event["dispatched_at"],
+        "goal": event["goal"],
+    }
+    async_delegation._persist_dispatch(record)
+    async_delegation._persist_completion(
+        event,
+        {"status": "completed", "summary": event["summary"]},
+    )
+    isolated.put(event)
+
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_not_awaited()
+    assert isolated.empty()
+    durable = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert durable["delivery_state"] == "dropped"
+    assert async_delegation.restore_undelivered_completions(queue.Queue()) == 0
+
+
+def test_routable_event_without_active_adapter_remains_durable_for_restart(
+    monkeypatch, isolated_registry,
+):
+    """A valid destination may become available later and must stay pending."""
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    event = _async_event("deleg_adapter_temporarily_absent")
+
+    from tools import async_delegation
+
+    record = {
+        "delegation_id": event["delegation_id"],
+        "session_key": event["session_key"],
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": event["dispatched_at"],
+        "goal": event["goal"],
+    }
+    async_delegation._persist_dispatch(record)
+    async_delegation._persist_completion(
+        event,
+        {"status": "completed", "summary": event["summary"]},
+    )
+    isolated.put(event)
+
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    runner.adapters = {}
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    durable = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert durable["delivery_state"] == "pending"
+    restored = queue.Queue()
+    assert async_delegation.restore_undelivered_completions(restored) == 1
+    assert restored.get_nowait()["delegation_id"] == event["delegation_id"]

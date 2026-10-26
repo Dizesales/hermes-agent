@@ -149,11 +149,12 @@ def _idle_compaction(
     wall-clock gap since ``_last_activity_ts``; a cheap gap check gates the estimate."""
     from agent import turn_context as _tc
 
+    agent._codex_responses_idle_compact_threshold_for_turn = None
     messages = out.messages
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
     if not (agent.compression_enabled and _idle_after > 0 and messages):
         return
-    _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
+    _idle_gap = _tc._idle_gap_since_durable_activity(agent, time.time())
     if _idle_gap < _idle_after:
         return
     _compressor = agent.context_compressor
@@ -168,13 +169,17 @@ def _idle_compaction(
         agent, messages, out.active_system_prompt or ""
     )
     # Don't summarise a thread already below the post-compression target size.
-    _idle_floor = int(_compressor.threshold_tokens * _compressor.summary_target_ratio)
+    configured_floor = getattr(agent, "compression_idle_compact_floor_tokens", None)
+    _idle_floor = configured_floor if type(configured_floor) is int and configured_floor > 0 else int(_compressor.threshold_tokens * _compressor.summary_target_ratio)
     _idle_cooldown = getattr(
         _compressor, "get_active_compression_failure_cooldown", lambda: None
     )()
     # What the previous pass actually produced — the honest floor versus the theoretical
     # ``_idle_floor``. Type pin: compressor doubles expose truthy non-ints here; only a real
     # int may raise the floor, anything else falls back to 0 (original semantics).
+    automatic_blocked = getattr(type(_compressor), "_automatic_compression_blocked", None)
+    if callable(automatic_blocked) and automatic_blocked(_compressor):
+        return
     _idle_last_compaction = getattr(_compressor, "last_compression_rough_tokens", 0)
     if not isinstance(_idle_last_compaction, int) or isinstance(_idle_last_compaction, bool):
         _idle_last_compaction = 0
@@ -202,6 +207,10 @@ def _idle_compaction(
     )
     if _idle_status:
         agent._emit_status(_idle_status)
+    from agent.native_compaction import native_compaction_eligible_for_agent
+    if native_compaction_eligible_for_agent(agent):
+        agent._codex_responses_idle_compact_threshold_for_turn = max(1, min(_idle_floor, _idle_tokens - 1))
+        return
     out.messages, out.active_system_prompt = agent._compress_context(
         messages, system_message, approx_tokens=_idle_tokens, task_id=effective_task_id, trigger="idle",
     )

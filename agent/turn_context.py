@@ -819,6 +819,7 @@ def _collect_pre_llm_call_context(
             platform=getattr(agent, "platform", None) or "",
             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
+            gateway_event_context=dict(getattr(agent, "_gateway_event_context", None) or {}),
         )
         try:
             # Spill oversized per-hook context to disk so a runaway plugin can't inflate every subsequent
@@ -1354,3 +1355,43 @@ def build_api_messages(
     if effective_system:
         api_messages = [{"role": "system", "content": effective_system}] + api_messages
     return api_messages, effective_system
+
+
+def _idle_gap_since_durable_activity(agent: Any, now: float) -> float:
+    """Return the best conservative between-turn idle gap for ``agent``.
+
+    Gateway cached agents reset ``_last_activity_ts`` at the start of each
+    external turn because that clock also feeds the in-flight stall watchdog.
+    Reading only that in-memory clock therefore makes idle compaction a no-op
+    on the main gateway surface. SessionDB's ``last_activity_at`` is the
+    durable between-turn clock and survives cache eviction/restart. If it is
+    absent or unreadable, fall back to the in-memory value; failure biases to
+    zero idle time, never to an eager compaction.
+    """
+    durable_ts = None
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if session_db is not None and session_id:
+        try:
+            row = session_db.get_session(session_id)
+            raw = row.get("last_activity_at") if isinstance(row, dict) else None
+            if raw is not None and not isinstance(raw, bool):
+                durable_ts = float(raw)
+        except (AttributeError, OSError, TypeError, ValueError):
+            durable_ts = None
+        except Exception:
+            logger.debug(
+                "Idle compaction: durable activity lookup failed for session=%s",
+                session_id,
+                exc_info=True,
+            )
+
+    previous_ts = durable_ts
+    if previous_ts is None:
+        try:
+            previous_ts = float(getattr(agent, "_last_activity_ts", now))
+        except (TypeError, ValueError):
+            previous_ts = now
+    if previous_ts <= 0 or previous_ts > now:
+        return 0.0
+    return max(0.0, now - previous_ts)

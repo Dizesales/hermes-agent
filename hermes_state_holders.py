@@ -478,8 +478,7 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
                         and _looks_like_hermes(argv)
                         and not _argv_scoped_to_other_home(argv, db_path)
                     ):
-                        cmdline = " ".join(argv)
-                        holders.append((pid, f"uninspectable holder: {cmdline[:80]}"))
+                        holders.append((pid, "uninspectable Hermes process"))
                     continue
                 for fd in fds:
                     fd_path = f"{fd_dir}/{fd}"

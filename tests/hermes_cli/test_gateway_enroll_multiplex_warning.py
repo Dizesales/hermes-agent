@@ -55,10 +55,9 @@ def test_fires_for_secondary_when_default_root_has_multiplex_on(topology, monkey
     assert fired is True
 
 
-def test_the_retired_opt_out_still_warns_a_secondary(topology, monkeypatch):
-    """``gateway.multiplex_profiles: false`` is retired: the gateway multiplexes anyway, so a
-    secondary IS served by the default listener and must still be told its relay URLs are
-    process-level. Staying silent here made this surface contradict the running gateway."""
+def test_explicit_opt_out_keeps_a_secondary_silent(topology, monkeypatch):
+    """Dize: ``gateway.multiplex_profiles: false`` is not retired — the default gateway stays
+    single-profile, a secondary is never served by it, so there is nothing to warn about."""
     (topology / "config.yaml").write_text(
         "gateway:\n  multiplex_profiles: false\n", encoding="utf-8"
     )
@@ -66,7 +65,7 @@ def test_the_retired_opt_out_still_warns_a_secondary(topology, monkeypatch):
 
     fired, _ = _run()
 
-    assert fired is True
+    assert fired is False
 
 
 def test_silent_for_default_profile_even_with_multiplex_on(topology, monkeypatch):
@@ -90,8 +89,8 @@ def test_env_override_forces_multiplex_on_without_config_flag(topology, monkeypa
     assert fired is True
 
 
-def test_the_env_override_is_retired_too(topology, monkeypatch):
-    """``GATEWAY_MULTIPLEX_PROFILES=false`` is the same retired opt-out by another spelling."""
+def test_the_env_override_opt_out_keeps_a_secondary_silent(topology, monkeypatch):
+    """Dize: ``GATEWAY_MULTIPLEX_PROFILES=false`` is the same explicit single-profile opt-out."""
     (topology / "config.yaml").write_text(
         "gateway:\n  multiplex_profiles: true\n", encoding="utf-8"
     )
@@ -100,7 +99,7 @@ def test_the_env_override_is_retired_too(topology, monkeypatch):
 
     fired, _ = _run()
 
-    assert fired is True
+    assert fired is False
 
 
 def test_silent_for_unrelated_dir_named_profiles(topology, tmp_path, monkeypatch):

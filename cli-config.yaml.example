@@ -803,6 +803,8 @@ compression:
   # post-compression target = threshold × target_ratio), so it never wastes a
   # summarization on a short idle thread. Example: 1800 = compact after 30 min idle.
   idle_compact_after_seconds: 0
+  # Optional absolute floor for idle compaction; null uses the adaptive floor.
+  idle_compact_floor_tokens: null
 
   # Gateway session-hygiene turn-hold budget (default: 10). Max seconds an
   # arriving user turn is held while a still-streaming hygiene summary

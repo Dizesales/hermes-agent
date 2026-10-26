@@ -727,6 +727,13 @@ export function createVersionResolver(fetchVersionFn, {
   };
 }
 
+export function normalizeWhatsAppLookupCandidates(values, limit = 3) {
+  const candidates = Array.isArray(values) ? values : [];
+  return [...new Set(candidates.map(value => String(value || '').replace(/\D/g, '')))]
+    .filter(value => /^\d{8,15}$/.test(value))
+    .slice(0, Math.max(0, limit));
+}
+
 const pad = (value, width = 2) => String(value).padStart(width, '0');
 
 /** `2026-09-28 13:18:46,062` in local time: the asctime shape every file in logs/ uses. */

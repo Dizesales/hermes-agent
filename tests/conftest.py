@@ -1416,6 +1416,26 @@ def _moa_caches_isolated():
     moa._runtime_cache.clear()
 
 
+@pytest.fixture(autouse=True)
+def _feishu_state_home_guard(request, _hermetic_environment, monkeypatch):
+    """Keep Feishu state isolated even when a test clears ``os.environ``."""
+    node_path = str(getattr(request.node, "path", "")).lower()
+    if "feishu" not in node_path and "lark" not in node_path:
+        return
+
+    isolated_home = Path(os.environ["HERMES_HOME"]).resolve()
+
+    def _safe_test_home() -> Path:
+        explicit = os.environ.get("HERMES_HOME", "").strip()
+        return Path(explicit).expanduser() if explicit else isolated_home
+
+    from gateway import status as gateway_status
+    from plugins.platforms.feishu import adapter as feishu_adapter
+
+    monkeypatch.setattr(feishu_adapter, "get_hermes_home", _safe_test_home)
+    monkeypatch.setattr(gateway_status, "_get_process_hermes_home", _safe_test_home)
+
+
 # ── Real-home tripwire (universal read/write guard) ──────────────────────────
 # The hermetic sandbox redirects get_hermes_home(), but TWO escape classes
 # remain: (a) code hardcoding Path.home()/".hermes" (the exact restatement

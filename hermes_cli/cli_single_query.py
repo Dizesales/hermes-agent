@@ -479,6 +479,8 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         )
         cli._seeded_first_message = _SeededQueryMessage(seeded_query, seeded_images)
         return cli.run()
+    from gateway.session_context import declare_stateless_channel
+    declare_stateless_channel()
     cli._single_query_mode = True  # agent waits the full MCP cold-start before its only tool snapshot
     # No PluginManager._cli_ref (#67597): the turn's plugin tools run in the gateway, and this process
     # loads no plugins (PLG-7).

@@ -283,7 +283,7 @@ class TestRuntimeFtsRebuild:
         # Should include PID 222 with the cmdline info
         assert len(holders) == 1
         assert holders[0][0] == 222
-        assert "hermes_cli.main" in holders[0][1]
+        assert holders[0][1] == "uninspectable Hermes process"
 
         # Cleanup
         os.chmod(proc_root / "222" / "fd", 0o755)

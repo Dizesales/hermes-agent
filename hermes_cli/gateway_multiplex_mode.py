@@ -1,19 +1,8 @@
-"""Boot-time verdict for ``gateway.multiplex_profiles`` (the default is on, and there is no opt-out).
+"""Boot-time profile selection with Dize's explicit single-profile compatibility.
 
-``GatewayConfig.from_dict`` leaves the flag ``None`` when neither config.yaml nor
-``GATEWAY_MULTIPLEX_PROFILES`` set it. Turning the default on must not make a default gateway
-double-bind a fleet that still runs per-profile gateways (two pollers on one bot token, port
-fights), so the implicit default is a *request*: the gateway runs the same preflight
-``hermes gateway migrate --multiplex`` runs and multiplexes only when the fold would have been
-safe. An explicit ``true`` is never second-guessed.
-
-An explicit ``false`` is RETIRED (multiplex-only ruling): it parses, it is logged, and it is then
-resolved exactly like an unset key. The key itself survives because it is still the RUNTIME
-mode flag every scoped code path reads (``config.multiplex_profiles``) — what it can no longer do
-is pin a second gateway process onto this host.
-
-The refusal is logged, never fatal: the gateway comes up standalone exactly as before the
-default flipped, and the log names the blocker plus ``hermes gateway migrate --multiplex``.
+An unset flag retains the native guarded multiplex default. Explicit false is
+an operator choice: preserve the launching profile and never rewrite it to true.
+Named standalone profiles continue using the native compatibility path.
 """
 
 from __future__ import annotations
@@ -95,7 +84,10 @@ def host_serves_named_profile(default_home: Path, home: Path) -> Optional[bool]:
     from hermes_cli.profiles import profile_is_standalone
     if profile_is_standalone(home):
         return False
-    return settled_explicit_flag(explicit_multiplex_flag(default_home))
+    flag = explicit_multiplex_flag(default_home)
+    if flag is False:  # Dize: an explicit false keeps the default gateway single-profile
+        return False
+    return settled_explicit_flag(flag)
 
 
 def default_gateway_multiplexes(default_home: Optional[Path] = None) -> bool:
@@ -115,7 +107,7 @@ def default_gateway_multiplexes(default_home: Optional[Path] = None) -> bool:
     if recorded is not None:
         return bool(recorded)
     flag = explicit_multiplex_flag(root)
-    return False if flag is None else True
+    return bool(flag)
 
 
 @dataclass(frozen=True)
@@ -262,6 +254,8 @@ def resolve_multiplex_mode(config) -> MultiplexDecision:
     standalone = standalone_launcher_decision(config)
     if standalone is not None:
         return standalone
+    if current is False:
+        return MultiplexDecision(False, "config", "explicit single-profile selection")
     if settled_explicit_flag(current):
         return MultiplexDecision(True, "config")
     retired_opt_out = current is False

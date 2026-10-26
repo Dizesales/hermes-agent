@@ -113,7 +113,9 @@ def _telegram_bot(token):
         from gateway.platforms.base import resolve_proxy_url
         proxy = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=["api.telegram.org"])
         if not proxy:
-            return Bot(token=token)
+            from telegram.request import HTTPXRequest
+            from plugins.platforms.telegram.telegram_network import TelegramFallbackTransport, SEED_FALLBACK_IPS
+            return Bot(token=token, request=HTTPXRequest(httpx_kwargs={"transport": TelegramFallbackTransport(SEED_FALLBACK_IPS)}))
         from telegram.request import HTTPXRequest
         logger.info("send_message: standalone Telegram send routed through proxy %s", proxy)
         return Bot(token=token, request=HTTPXRequest(proxy=proxy), get_updates_request=HTTPXRequest(proxy=proxy))
@@ -258,6 +260,7 @@ def _telegram_format(message):
 
 async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
     """One-shot Telegram Bot API send; parse failures fall back to plain text."""
+    bot = None
     try:
         formatted, send_parse_mode, _has_html = _telegram_format(message)
         bot = _telegram_bot(token)
@@ -302,12 +305,18 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 logger.error(warnings[-1])
         if last_msg is None:
             return {"error": _NO_DELIVERABLE, **({"warnings": warnings} if warnings else {})}
-        return _success("telegram", chat_id, warnings, message_id=str(last_msg.message_id))
+        return _success("telegram", chat_id, warnings, message_id=str(last_msg.message_id), thread_id=getattr(last_msg, "message_thread_id", None), telegram_chat_id=getattr(getattr(last_msg, "chat", None), "id", None))
     except ImportError:
         return {"error": "python-telegram-bot not installed. Run: "
                 f"{install_hint('telegram')}"}
     except Exception as e:
         return _error(f"Telegram send failed: {e}")
+    finally:
+        if bot is not None:
+            try:
+                await bot.request.shutdown()
+            except Exception:
+                logger.debug("Standalone Telegram transport cleanup failed", exc_info=True)
 
 
 def _live_adapter(platform, *, lookup_failed_warning=None):

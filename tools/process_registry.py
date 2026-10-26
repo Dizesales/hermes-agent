@@ -1802,7 +1802,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             return evt_session_key == session_key
         # Restored payloads from a previous process: an unfiltered drain cannot prove
         # ownership, so leave them for the owner.
-        return not (is_async_delegation and evt.get("restored"))
+        return not is_async_delegation
 
     def restore_completions(self) -> int:
         """Rehydrate durable delegation completions from the LAUNCH profile's ledger, once per

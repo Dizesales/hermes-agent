@@ -749,3 +749,40 @@ def test_same_job_id_wedged_in_one_profile_does_not_hide_live_run_in_another(mon
     finally:
         sched.release_running_job("daily-brief", home_a)
         sched.release_running_job("daily-brief", home_b)
+
+
+def _native_delegation(delegation_id="dlg-1"):
+    return {"kind": "delegation", "delegation_id": delegation_id, "state": "running",
+            "pid": 1, "child_count": 0}
+
+
+def test_native_delegation_units_are_awaitable_restart_work(monkeypatch, tmp_path):
+    """Hefesto drain overlay: detached native delegations count for the restart wait, not only the drain.
+
+    The 0.22.1 merge rebuilt ``_awaitable_work_count`` from its parts and left the overlay's units out,
+    so a restart with only a background delegation in flight skipped the after-turn wait and gave it
+    just ``restart_drain_timeout`` before interrupting.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("cron.jobs.load_jobs", list)
+    runner, _adapter = make_restart_runner()
+    runner._native_delegation_work_snapshot = lambda: [_native_delegation()]
+    assert runner._active_work_count() == 1
+    assert runner._awaitable_work_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_after_turn_wait_holds_for_native_delegation(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("cron.jobs.load_jobs", list)
+    runner, _adapter = make_restart_runner()
+    runner._restart_after_turn_timeout = 300.0
+    runner._scale_to_zero_status = MagicMock()
+    units = [_native_delegation()]
+    runner._native_delegation_work_snapshot = lambda: list(units)
+
+    waiter = asyncio.create_task(runner._await_active_work_before_restart())
+    await asyncio.sleep(0.3)
+    assert not waiter.done(), "a running delegation must hold the restart wait"
+    units.clear()
+    assert await asyncio.wait_for(waiter, timeout=2.0) is True

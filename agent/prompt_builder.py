@@ -1320,6 +1320,7 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]], category_descriptions: dict[str, str],
     compact_categories: frozenset[str] | None, available_tools: set[str] | None, unloadable: list[str] = (),
+    selection_policy: str = "broad",
 ) -> str:
     """Render the ## Skills block; "" when there is nothing to list. *unloadable* names (different skills
     sharing a name AND relative path within one tier — one root or several) get a rename note instead of a row skill_view would refuse."""
@@ -1359,6 +1360,21 @@ def _render_skills_index(
             + "\n<available_skills>\n" + "\n".join(index_lines) + "\n</available_skills>"
             + hidden_note
         )
+    if selection_policy == "task_relevant":
+        return (
+            "## Skills\n"
+            "Review the skill names and descriptions below. Load a skill with skill_view(name) "
+            "when the user explicitly requests it, an applicable instruction requires its workflow, "
+            "or its stated purpose directly supports the current task. Follow its instructions. "
+            "Choose the smallest relevant set; do not load skills only because of shared keywords "
+            "or tangential relevance. Required safety, quality and project procedures still apply. "
+            "When a description is insufficient to assess a plausible match, inspect that skill. "
+            "Keep all needed capabilities and load further skills when the task calls for them.\n"
+            "If a skill has issues, fix it with skill_manage(action='patch').\n"
+            "After difficult/iterative tasks, offer to save as a skill.\n"
+            "<available_skills>\n" + "\n".join(index_lines) + "\n</available_skills>\n"
+            "Proceed without loading a skill when none meets these criteria." + hidden_note
+        )
     return (
         "## Skills\n"
         "Before replying, scan the skills below. If a skill matches or is even partially relevant to your "
@@ -1393,6 +1409,11 @@ def _build_skills_system_prompt_inner(
 ) -> str:
     # The resolved platform is part of the key: per-platform disabled-skill lists need distinct cache entries.
     _platform_hint = _current_session_platform_hint()
+    from hermes_cli.config import load_config_readonly
+    skills_config = load_config_readonly().get("skills", {})
+    selection_policy = skills_config.get("selection_policy", "broad") if isinstance(skills_config, dict) else "broad"
+    if selection_policy not in ("broad", "task_relevant"):
+        selection_policy = "broad"
     disabled = get_disabled_skill_names(_platform_hint or None)
     # Plugin-registered skills (ctx.register_skill) are registry state, not files under any scanned
     # root — the snapshot manifest can't see them change, so they participate in the cache key.
@@ -1408,7 +1429,7 @@ def _build_skills_system_prompt_inner(
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
-        _oneshot_prompt_variant(), tuple(plugin_rows),
+        _oneshot_prompt_variant(), tuple(plugin_rows), selection_policy,
     )
     snapshot = _load_skills_snapshot(skills_dir, manifest)
     app_gated = snapshot is not None and any(
@@ -1478,7 +1499,8 @@ def _build_skills_system_prompt_inner(
             logger.debug("Could not write skills prompt snapshot: %s", e)
 
     unloadable = sorted({e["name"] for e in visible_entries if not e["load_name"]})
-    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools, unloadable)
+    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools, unloadable,
+                                  selection_policy=selection_policy)
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)

@@ -844,6 +844,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if not normalized_user_id:
             return False
         normalized_chat_type = self._normalize_chat_type(chat_type, is_forum=thread_id is not None)
+        dm_allowed = self._telegram_dm_allowed_users()
+        if normalized_chat_type == "dm" and dm_allowed is not None and "*" not in dm_allowed and normalized_user_id not in dm_allowed:
+            return False
         # Preferred: the auth callback GatewayRunner injects (set_authorization_check) → full
         # _is_user_authorized chain; also works for a multiplexed adapter whose _message_handler is a
         # profile closure. getattr tolerates partially-constructed adapters (object.__new__ in tests).
@@ -926,7 +929,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     def _telegram_auth_env_configured(self) -> bool:
         """Return True when Telegram auth env vars make an early decision safe."""
         keys = (
-            "TELEGRAM_ALLOWED_USERS", "TELEGRAM_GROUP_ALLOWED_USERS", "TELEGRAM_GROUP_ALLOWED_CHATS",
+            "TELEGRAM_ALLOWED_USERS", "TELEGRAM_DM_ALLOWED_USERS", "TELEGRAM_GROUP_ALLOWED_USERS", "TELEGRAM_GROUP_ALLOWED_CHATS",
             "TELEGRAM_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS")
         return any(_scoped_gate_env(key).strip() for key in keys)
 
@@ -948,6 +951,20 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         extra = getattr(getattr(self, "config", None), "extra", None) or {}
         return str(extra.get("unauthorized_dm_behavior", "")).strip().lower() in ("pair", "decline")
 
+    def _telegram_dm_allowed_users(self) -> Optional[set[str]]:
+        """Return the optional DM-only ceiling without changing group ACLs."""
+        configured = self.config.extra.get("dm_allow_from")
+        if configured is None:
+            configured = _scoped_gate_env("TELEGRAM_DM_ALLOWED_USERS") or None
+        if configured is None:
+            return None
+        if isinstance(configured, str):
+            values = configured.split(",")
+        else:
+            values = configured
+        return {str(user).strip() for user in values if str(user).strip()}
+
+
     def _is_user_authorized_from_message(self, message: Message) -> bool:
         """Intake auth prefilter, run BEFORE batching/event construction/group observation.
 
@@ -958,13 +975,17 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         # No identity → service message or channel post without sender_chat; defer to message gating.
         if not user_id:
             return True
+        dm_allowed = self._telegram_dm_allowed_users()
+        if source.chat_type == "dm" and dm_allowed is not None and "*" not in dm_allowed and user_id not in dm_allowed:
+            return False
         authorized: Optional[bool] = None
         # Adapter-level allow_from (DMs) / group_allow_from (groups) are the sole authority if set.
         adapter_allow_from = self.config.extra.get(
             "group_allow_from" if (source.chat_type or "") in ("group", "forum", "channel") else "allow_from")
         if adapter_allow_from is not None:
             allowed = _coerce_allow_set(adapter_allow_from)
-            authorized = user_id in allowed or "*" in allowed
+            if user_id in allowed or "*" in allowed:
+                authorized = True
         # Instance-level override only (tests): the class method _is_callback_user_authorized is for
         # inline buttons and must not become a user-id-only shortcut for real messages.
         if authorized is None:
@@ -981,7 +1002,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             has_callback = getattr(self, "_authorization_check", None) is not None
             if has_callback or auth_fn is not None:
                 # No allowlist → unknown DMs must reach pairing, not be default-denied here.
-                if not self._telegram_auth_env_configured():
+                if not self._telegram_auth_env_configured() and adapter_allow_from is None:
                     return True
                 decision = self._is_sender_authorized(
                     user_id, chat_type=source.chat_type, chat_id=source.chat_id, is_bot=source.is_bot,
@@ -996,7 +1017,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if authorized is None:
             authorized = self._env_allowlist_decision(user_id)
             if authorized is None:
-                return True
+                authorized = False if adapter_allow_from is not None else True
         if authorized:
             return True
         # Unauthorized DM the gateway would pair: forward so pairing can run.
